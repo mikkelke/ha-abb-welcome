@@ -311,7 +311,9 @@ record_clip:
     filename:
       name: Filename
       description: >-
-        Optional output filename stem (no extension). Defaults to
+        Optional output filename stem (no extension), written into the
+        configured ring clip directory. Must be a bare name: no slashes and
+        no path segments. Defaults to
         abb_ringclip_<timestamp>_<station_id>.
       required: false
       selector:

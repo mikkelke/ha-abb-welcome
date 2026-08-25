@@ -477,6 +477,10 @@ async def _capture_ring_clip(
 
         try:
             writer = RingClipWriter(hass, target_dir, base_name)
+        except ValueError as err:
+            # A rejected caller-supplied `filename`; say so plainly rather
+            # than blaming the directory.
+            raise HomeAssistantError(str(err)) from err
         except (PermissionError, OSError) as err:
             raise HomeAssistantError(
                 f"Could not open ring clip capture file in {target_dir}: {err}"
@@ -521,7 +525,7 @@ async def _capture_ring_clip(
                         writer2 = RingClipWriter(
                             hass, target_dir, f"{base_name}.part2"
                         )
-                    except (PermissionError, OSError) as err:
+                    except (ValueError, PermissionError, OSError) as err:
                         _LOGGER.error(
                             "[abb] ring clip: could not open continuation segment "
                             "for station=%s: %s",

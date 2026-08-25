@@ -209,6 +209,38 @@ def _unlink_if_exists(path: Path) -> None:
         pass
 
 
+# ``record_clip`` accepts a caller-supplied ``filename``, so a clip name is
+# untrusted input. Cap it well under the usual 255-byte limit so the
+# ``.part2`` continuation suffix and the ``.h264``/``.mp4`` extensions
+# always still fit.
+_MAX_CLIP_NAME_LEN = 120
+
+
+def validate_clip_name(name: str) -> str:
+    """Return ``name`` if it is a bare file stem, else raise ``ValueError``.
+
+    This is the boundary that keeps a clip out of the rest of the
+    filesystem: the ``record_clip`` service takes the stem straight from
+    the caller, so ``../../configuration`` would otherwise be joined onto
+    the configured clip directory and resolve to a write outside it.
+    """
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("ring clip file name must not be empty")
+    if len(cleaned) > _MAX_CLIP_NAME_LEN:
+        raise ValueError(
+            f"ring clip file name must be at most {_MAX_CLIP_NAME_LEN} "
+            f"characters, got {len(cleaned)}"
+        )
+    if "\x00" in cleaned:
+        raise ValueError("ring clip file name must not contain a null byte")
+    if "/" in cleaned or "\\" in cleaned or cleaned in {".", ".."}:
+        raise ValueError(
+            f"ring clip file name must be a bare file name, not a path: {cleaned!r}"
+        )
+    return cleaned
+
+
 class RingClipWriter:
     """Depacketizes RTP video into an in-memory Annex-B buffer, then to mp4.
 
@@ -226,14 +258,24 @@ class RingClipWriter:
 
     def __init__(self, hass: HomeAssistant, target_dir: Path, name: str) -> None:
         self.hass = hass
-        self.name = name
+        self.name = validate_clip_name(name)
         target_dir = Path(target_dir)
         if not hass.config.is_allowed_path(str(target_dir)):
             raise PermissionError(
                 f"ring clip directory is not an allowed Home Assistant path: "
                 f"{target_dir}"
             )
-        self.path = target_dir / f"{name}.h264"
+        path = (target_dir / f"{self.name}.h264").resolve()
+        # Belt and braces behind validate_clip_name: whatever the stem was,
+        # the file this writer opens has to sit directly in target_dir.
+        # resolve() touches the filesystem, but only once per clip (not per
+        # packet), and it is what makes the check survive a symlinked
+        # target_dir.
+        if path.parent != target_dir.resolve():
+            raise PermissionError(
+                f"ring clip path escapes its directory {target_dir}: {path}"
+            )
+        self.path = path
         self._buffer = bytearray()
         self._buffer_capped = False
         self._depacketizer = H264Depacketizer()
