@@ -412,6 +412,78 @@ def unlock_and_announce(self, _event_name, _data, _kwargs):
     )
 ```
 
+## Ring Clips
+
+A ring call is exclusive: the gateway sends one `INVITE`, and only one client
+can answer it. With ring-clip recording enabled, this integration becomes
+that client on every ring — **it answers the ring itself, so the indoor
+station cannot**. This is a deliberate policy choice, not a bug, which is why
+ring-clip recording defaults to off.
+
+HA's stream/go2rtc pipeline takes roughly 6.4 seconds to produce a first
+frame, but a ring call itself typically lasts only around 3 seconds — long
+before `camera.record` could ever see a frame. Ring clips instead read the
+raw H.264 RTP video straight off the SIP call (no go2rtc, no HA stream
+component) and remux it to mp4 with ffmpeg once recording stops. Clips are
+video-only: audio packets are ignored, so a ring clip has no sound.
+
+Options, under **ABB Welcome options**:
+
+- **Record ring clips**: the master switch. Off by default; every other
+  ring-clip option below is inert while this is off.
+- **Ring clip duration (seconds)**: how long to record, from 2 to 60 seconds
+  (default 10).
+- **Ring clip storage directory**: relative to the Home Assistant config
+  folder (default `www/abb_doorbell`). Anything under `www/` is also served
+  at `/local/...`, which is what the fired event's `url` field points to.
+- **Continue recording after the ring call ends**: if the visitor hangs up
+  before the configured duration has elapsed, HA waits briefly and re-dials
+  the same station to keep recording — as a second segment merged into the
+  final clip — up to the total duration. This applies only to automatic ring
+  captures, never to a manual `record_clip` call.
+- **Stations that record ring clips**: restricts automatic ring-clip
+  recording to the selected outdoor stations. Leave empty to record every
+  station's rings, which is the default and matches the integration's
+  original entry-wide behavior. This control only appears once an entry has
+  more than one station.
+
+This shares `Allow pickup`'s master gate (see Allow Pickup above): with
+pickup off, HA refuses every incoming call regardless of ring-clip settings,
+so no clip is ever captured either.
+
+`switch.<gateway>_record_ring_clips` mirrors `Record ring clips`. Flipping it
+takes effect on the very next ring; it does not reload the integration.
+
+Every automatic ring capture, and every `record_clip` service call, fires
+`abb_welcome_ring_clip` once the mp4 remux finishes:
+
+```json
+{
+  "station_id": "100000001",
+  "filename": "abb_ringclip_20260101_120000_100000001.mp4",
+  "path": "/config/www/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
+  "url": "/local/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
+  "duration_s": 9.8,
+  "frames": 58,
+  "segments": 1,
+  "started_at": "2026-01-01T12:00:00.123456+00:00",
+  "reason": "ring",
+  "ok": true
+}
+```
+
+`abb_welcome.record_clip` captures a clip on demand — targeting a camera
+entity, an outdoor `station_id`, or an `entry_id` — through the same capture
+and event path as an automatic ring, with `reason` set to `"service"` in the
+fired event:
+
+```yaml
+action: abb_welcome.record_clip
+data:
+  entity_id: camera.abb_welcome_front_door
+  duration: 15
+```
+
 ## Scrypted RTSP Endpoint
 
 Scrypted needs a LAN-reachable RTSP URL. HA's bundled go2rtc RTSP listener is
@@ -500,6 +572,9 @@ Options:
 - **Preferred LAN RTSP proxy port**: tried first; HA falls back to another free
   port if it is occupied.
 - **Allow pickup from streams**: default for the `Allow pickup` switch.
+- **Stations that record ring clips**: restricts automatic ring-clip
+  recording to selected outdoor stations. Leave empty to record every
+  station, which is the default. See Ring Clips above.
 
 ### Unlock Strategy
 
