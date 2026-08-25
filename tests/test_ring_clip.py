@@ -217,6 +217,59 @@ def test_writer_enforces_is_allowed_path(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../../../configuration",
+        "../escape",
+        "sub/dir/clip",
+        "/etc/abb_clip",
+        "back\\slash",
+        "..",
+        ".",
+        "",
+        "   ",
+        "nul\x00byte",
+        "x" * 121,
+    ],
+)
+def test_writer_rejects_names_that_are_not_bare_file_names(
+    tmp_path: Path, name: str
+) -> None:
+    """`record_clip` takes `filename` from the caller, so it must not escape.
+
+    Before this check a name of `../../../configuration` resolved to a write
+    outside the configured clip directory entirely.
+    """
+    target = tmp_path / "clips"
+    target.mkdir()
+    hass = _Hass()
+    with pytest.raises(ValueError):
+        ring_clip.RingClipWriter(hass, target, name)
+    assert list(target.iterdir()) == []
+    # Nothing was created next to the directory either.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["clips"]
+
+
+def test_writer_accepts_ordinary_and_continuation_names(tmp_path: Path) -> None:
+    hass = _Hass()
+    for name in ("abb_ringclip_20260825_120000_2_1", "clip.part2", "clip-2"):
+        writer = ring_clip.RingClipWriter(hass, tmp_path, name)
+        assert writer.path.parent == tmp_path.resolve()
+        assert writer.path.name == f"{name}.h264"
+
+
+def test_writer_containment_survives_a_symlinked_directory(tmp_path: Path) -> None:
+    """The resolved file must sit in the resolved target, symlink or not."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    hass = _Hass()
+    writer = ring_clip.RingClipWriter(hass, link, "clip")
+    assert writer.path == real.resolve() / "clip.h264"
+
+
 def test_writer_frames_nals_to_annex_b_buffer(tmp_path: Path) -> None:
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
