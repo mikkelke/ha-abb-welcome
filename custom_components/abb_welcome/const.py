@@ -72,6 +72,12 @@ DEFAULT_RING_CLIP_DIR = "www/abb_doorbell"
 CONF_RING_CLIP_CONTINUE_AFTER_HANGUP = "ring_clip_continue_after_hangup"
 DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP = False
 
+# Per-station opt-in: restricts automatic ring-clip recording (still gated by
+# CONF_RECORD_RING_CLIPS above) to a subset of an entry's stations. Empty or
+# absent means every station records, i.e. today's entry-wide behavior.
+CONF_RING_CLIP_STATIONS = "ring_clip_stations"
+DEFAULT_RING_CLIP_STATIONS: tuple[str, ...] = ()
+
 # Per-integration option: which unlock strategy to use.
 #   hybrid   — fast plain MESSAGE for an explicit physical-default station,
 #              INVITE-then-MESSAGE for the rest. Legacy web-admin entries use
@@ -174,6 +180,23 @@ def ring_clip_seconds(options: Mapping[str, object]) -> int:
     except (TypeError, ValueError):
         return DEFAULT_RING_CLIP_SECONDS
     return max(MIN_RING_CLIP_SECONDS, min(MAX_RING_CLIP_SECONDS, seconds))
+
+
+def station_records_ring_clips(
+    options: Mapping[str, object], station_id: str
+) -> bool:
+    """Return whether ``station_id`` should produce an automatic ring clip.
+
+    ``CONF_RING_CLIP_STATIONS`` narrows automatic ring-clip recording to a
+    subset of stations. Empty, absent, or a malformed value means every
+    station records — the integration's original entry-wide behavior. Kept
+    as one shared helper so every caller of this membership test agrees,
+    rather than each inlining its own copy.
+    """
+    stations = options.get(CONF_RING_CLIP_STATIONS, DEFAULT_RING_CLIP_STATIONS)
+    if not isinstance(stations, (list, tuple, set)) or not stations:
+        return True
+    return station_id in stations
 
 
 def unlockable_station_ids(doors: object) -> tuple[str, ...]:
