@@ -55,6 +55,7 @@ from .const import (
     gateway_profile,
     normalized_unlock_routing,
     ring_clip_seconds,
+    station_records_ring_clips,
     topology_refresh_action,
     topology_refresh_error,
 )
@@ -699,6 +700,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if (
                 entry.options.get(CONF_RECORD_RING_CLIPS, DEFAULT_RECORD_RING_CLIPS)
                 and is_pickup_allowed(hass, entry.entry_id)
+                and station_records_ring_clips(entry.options, station_id)
             ):
                 # Background task only — see _capture_ring_clip's docstring.
                 # _on_ring itself stays synchronous and is never awaited by

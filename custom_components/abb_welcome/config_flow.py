@@ -31,6 +31,7 @@ from .const import (
     CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
     CONF_RING_CLIP_DIR,
     CONF_RING_CLIP_SECONDS,
+    CONF_RING_CLIP_STATIONS,
     CONF_TALKBACK_OUTPUT_GAIN_DB,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
@@ -39,6 +40,7 @@ from .const import (
     DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
     DEFAULT_RING_CLIP_DIR,
     DEFAULT_RING_CLIP_SECONDS,
+    DEFAULT_RING_CLIP_STATIONS,
     DOMAIN,
     GATEWAY_CAPABILITIES,
     GATEWAY_PROFILE_APP_MANAGED,
@@ -796,6 +798,19 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
         station_ids = unlockable_station_ids(self._entry.data.get("doors"))
         station_id_set = set(station_ids)
         multiple_app_doors = is_app_managed and len(station_ids) > 1
+
+        # Ring clips can come from any station (unlock-capable or not), so
+        # this uses every door on the entry rather than unlockable_station_ids.
+        ring_clip_door_names = {
+            str(door.get("station_id", "")).strip(): str(
+                door.get("name") or door.get("station_id") or "Door"
+            )
+            for door in self._entry.data.get("doors", []) or []
+            if isinstance(door, dict) and str(door.get("station_id", "")).strip()
+        }
+        ring_clip_station_ids = list(ring_clip_door_names)
+        ring_clip_station_id_set = set(ring_clip_station_ids)
+        show_ring_clip_stations = len(ring_clip_station_ids) > 1
         submitted: dict | None = None
 
         if user_input is not None:
@@ -822,6 +837,14 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             data[CONF_RING_CLIP_DIR] = (
                 str(data.get(CONF_RING_CLIP_DIR) or "").strip() or DEFAULT_RING_CLIP_DIR
             )
+            raw_ring_clip_stations = data.get(CONF_RING_CLIP_STATIONS, [])
+            if not isinstance(raw_ring_clip_stations, (list, tuple, set)):
+                raw_ring_clip_stations = [raw_ring_clip_stations]
+            data[CONF_RING_CLIP_STATIONS] = [
+                str(station_id).strip()
+                for station_id in raw_ring_clip_stations
+                if str(station_id).strip() in ring_clip_station_id_set
+            ]
             if not errors:
                 return self.async_create_entry(title="", data=data)
 
@@ -907,6 +930,17 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                 DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
             )
         )
+        current_ring_clip_stations = [
+            station_id
+            for station_id in (
+                submitted.get(CONF_RING_CLIP_STATIONS, DEFAULT_RING_CLIP_STATIONS)
+                if submitted is not None
+                else self._entry.options.get(
+                    CONF_RING_CLIP_STATIONS, DEFAULT_RING_CLIP_STATIONS
+                )
+            )
+            if station_id in ring_clip_station_id_set
+        ]
         schema_fields = {
             vol.Required(
                 CONF_UNLOCK_STRATEGY, default=current
@@ -953,6 +987,24 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                 default=current_ring_clip_continue_after_hangup,
             ): selector.BooleanSelector(),
         }
+        if show_ring_clip_stations:
+            schema_fields[
+                vol.Optional(
+                    CONF_RING_CLIP_STATIONS, default=current_ring_clip_stations
+                )
+            ] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {
+                            "value": station_id,
+                            "label": ring_clip_door_names.get(station_id, station_id),
+                        }
+                        for station_id in ring_clip_station_ids
+                    ],
+                    multiple=True,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
         if is_app_managed and station_ids:
             door_names = {
                 str(door.get("station_id", "")).strip(): str(

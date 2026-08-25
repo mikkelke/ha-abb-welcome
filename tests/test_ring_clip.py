@@ -45,6 +45,7 @@ def _load(name: str) -> types.ModuleType:
 _install_homeassistant_stubs()
 media = _load("media_pipeline")
 ring_clip = _load("ring_clip")
+const = _load("const")
 
 
 def _rtp(seq: int, payload: bytes, *, pt: int = 96) -> bytes:
@@ -164,6 +165,35 @@ def test_sequence_gap_discards_fu_a_and_waits_for_sps_or_idr() -> None:
     normal = b"\x61" + b"frame_after_keyframe"
     assert depacketizer.push(_rtp(7, normal)) == [normal]
     assert depacketizer.nals_out == 3  # frame1, idr, normal (the rest were dropped)
+
+
+# --------------------------------------------------------------------------- #
+# station_records_ring_clips (custom_components/abb_welcome/const.py)
+# --------------------------------------------------------------------------- #
+
+
+def test_station_records_ring_clips_defaults_to_every_station() -> None:
+    """Absent or empty CONF_RING_CLIP_STATIONS records every station."""
+    assert const.station_records_ring_clips({}, "station1") is True
+    assert (
+        const.station_records_ring_clips(
+            {const.CONF_RING_CLIP_STATIONS: []}, "station1"
+        )
+        is True
+    )
+
+
+def test_station_records_ring_clips_restricts_to_the_named_station() -> None:
+    options = {const.CONF_RING_CLIP_STATIONS: ["station1"]}
+    assert const.station_records_ring_clips(options, "station1") is True
+    assert const.station_records_ring_clips(options, "station2") is False
+
+
+def test_station_records_ring_clips_treats_a_malformed_value_as_unrestricted() -> None:
+    """A non-list option value must fail open, not silently drop every clip."""
+    options = {const.CONF_RING_CLIP_STATIONS: "station1"}
+    assert const.station_records_ring_clips(options, "station1") is True
+    assert const.station_records_ring_clips(options, "station2") is True
 
 
 # --------------------------------------------------------------------------- #

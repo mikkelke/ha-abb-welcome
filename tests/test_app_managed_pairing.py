@@ -737,3 +737,46 @@ def test_talkback_gain_options_use_profile_defaults_and_persist_value() -> None:
     saved = asyncio.run(app_flow.async_step_init(submitted))
     assert saved["type"] == "create_entry"
     assert saved["data"][module.CONF_TALKBACK_OUTPUT_GAIN_DB] == 1.5
+
+
+def test_ring_clip_stations_selector_hidden_for_single_station_entry() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeOptionsFlow(
+        _options_entry(
+            module, [{"name": "Synthetic Front", "station_id": "station-front"}]
+        )
+    )
+    result = asyncio.run(flow.async_step_init())
+    assert not any(
+        key == module.CONF_RING_CLIP_STATIONS for key in result["data_schema"]
+    )
+
+
+def test_ring_clip_stations_selector_shown_for_multi_station_entry() -> None:
+    module = _load_config_flow()
+    doors = [
+        {"name": "Synthetic Back", "station_id": "station-back"},
+        {"name": "Synthetic Front", "station_id": "station-front"},
+    ]
+    flow = module.ABBWelcomeOptionsFlow(_options_entry(module, doors))
+    result = asyncio.run(flow.async_step_init())
+    assert any(
+        key == module.CONF_RING_CLIP_STATIONS for key in result["data_schema"]
+    )
+
+
+def test_ring_clip_stations_option_drops_unknown_station_ids() -> None:
+    module = _load_config_flow()
+    doors = [
+        {"name": "Synthetic Back", "station_id": "station-back"},
+        {"name": "Synthetic Front", "station_id": "station-front"},
+    ]
+    flow = module.ABBWelcomeOptionsFlow(_options_entry(module, doors))
+    submitted = _options_input(module, module.UNLOCK_STRATEGY_STANDARD)
+    submitted[module.CONF_RING_CLIP_STATIONS] = [
+        "station-front",
+        "station-does-not-exist",
+    ]
+    result = asyncio.run(flow.async_step_init(submitted))
+    assert result["type"] == "create_entry"
+    assert result["data"][module.CONF_RING_CLIP_STATIONS] == ["station-front"]
