@@ -270,6 +270,34 @@ def test_writer_containment_survives_a_symlinked_directory(tmp_path: Path) -> No
     assert writer.path == real.resolve() / "clip.h264"
 
 
+def test_writer_counts_pictures_not_slices(tmp_path: Path) -> None:
+    """ABB stations send one picture as several slice NALs.
+
+    Measured on a live M22403-W ring: 315 slice NALs for 53 actual pictures,
+    5.94 slices each. Counting slices made fps come out ~6x too high, so
+    ffmpeg squeezed a 13.0 s doorstep event into a 1.77 s mp4 that played
+    back at roughly 6x speed. Only a slice with first_mb_in_slice == 0
+    starts a new picture.
+    """
+    hass = _Hass()
+    writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
+
+    seq = 0
+    for picture in range(4):
+        # First slice of the picture: first_mb_in_slice == 0, so ue(v) is a
+        # single 1 bit and the first RBSP byte has its top bit set.
+        seq += 1
+        writer.on_video(_rtp(seq, bytes([0x65, 0x88, picture])))
+        # Five continuation slices of the SAME picture: first_mb_in_slice > 0
+        # never sets that bit.
+        for slice_no in range(5):
+            seq += 1
+            writer.on_video(_rtp(seq, bytes([0x65, 0x40, picture, slice_no])))
+
+    assert writer.nals == 24  # every slice is still written to the file
+    assert writer.frames == 4  # but only four pictures exist
+
+
 def test_writer_frames_nals_to_annex_b_buffer(tmp_path: Path) -> None:
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
@@ -279,14 +307,14 @@ def test_writer_frames_nals_to_annex_b_buffer(tmp_path: Path) -> None:
 
     writer.on_video(_rtp(1, b"\x67SPS"))
     writer.on_video(_rtp(2, b"\x68PPS"))
-    writer.on_video(_rtp(3, b"\x65KEYFRAME"))
+    writer.on_video(_rtp(3, b"\x65\x88KEYFRAME"))
     writer.on_audio(b"ignored-audio-should-not-raise")
     writer.close()
 
     expected = (
         b"\x00\x00\x00\x01\x67SPS"
         b"\x00\x00\x00\x01\x68PPS"
-        b"\x00\x00\x00\x01\x65KEYFRAME"
+        b"\x00\x00\x00\x01\x65\x88KEYFRAME"
     )
     assert bytes(writer._buffer) == expected
     assert not writer.path.exists()  # still nothing on disk after close()
@@ -303,12 +331,12 @@ def test_writer_close_is_idempotent_and_stops_accepting_packets(
 ) -> None:
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
-    writer.on_video(_rtp(1, b"\x65X"))
+    writer.on_video(_rtp(1, b"\x65\x88X"))
     writer.close()
     writer.close()  # must not raise
 
     size_before = len(writer._buffer)
-    writer.on_video(_rtp(2, b"\x65Y"))
+    writer.on_video(_rtp(2, b"\x65\x88Y"))
     assert len(writer._buffer) == size_before
     assert writer.nals == 1
 
@@ -327,8 +355,8 @@ def test_finalize_computes_fps_writes_mp4_and_removes_h264(
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
     writer.on_video(_rtp(1, b"\x67SPS"))  # t=100.0, not a coded picture
-    writer.on_video(_rtp(2, b"\x65IDR"))  # t=100.5, frame 1
-    writer.on_video(_rtp(3, b"\x61P"))  # t=101.0, frame 2
+    writer.on_video(_rtp(2, b"\x65\x88IDR"))  # t=100.5, frame 1
+    writer.on_video(_rtp(3, b"\x61\x88P"))  # t=101.0, frame 2
 
     captured: dict[str, object] = {}
     process = _FakeProcess(returncode=0)
@@ -366,7 +394,7 @@ def test_finalize_keeps_h264_and_reports_failure_on_ffmpeg_error(
 ) -> None:
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
-    writer.on_video(_rtp(1, b"\x65IDR"))
+    writer.on_video(_rtp(1, b"\x65\x88IDR"))
 
     process = _FakeProcess(returncode=1, stderr=b"decoder error: bad stream")
 
@@ -406,12 +434,12 @@ def test_finalize_concatenates_multi_segment_and_removes_both_h264(
     hass = _Hass()
     writer1 = ring_clip.RingClipWriter(hass, tmp_path, "clip")
     writer1.on_video(_rtp(1, b"\x67SPS"))
-    writer1.on_video(_rtp(2, b"\x65IDR1"))
+    writer1.on_video(_rtp(2, b"\x65\x88IDR1"))
     writer1.close()
 
     writer2 = ring_clip.RingClipWriter(hass, tmp_path, "clip.part2")
     writer2.on_video(_rtp(1, b"\x67SPS"))
-    writer2.on_video(_rtp(2, b"\x65IDR2"))
+    writer2.on_video(_rtp(2, b"\x65\x88IDR2"))
     writer2.close()
 
     # Segments are buffered in memory (never written per-segment to disk),
@@ -419,9 +447,9 @@ def test_finalize_concatenates_multi_segment_and_removes_both_h264(
     # not read back from either writer's (nonexistent, pre-finalize) path.
     expected_concat = (
         b"\x00\x00\x00\x01\x67SPS"
-        b"\x00\x00\x00\x01\x65IDR1"
+        b"\x00\x00\x00\x01\x65\x88IDR1"
         b"\x00\x00\x00\x01\x67SPS"
-        b"\x00\x00\x00\x01\x65IDR2"
+        b"\x00\x00\x00\x01\x65\x88IDR2"
     )
 
     captured: dict[str, object] = {}
@@ -459,7 +487,7 @@ def test_finalize_drops_empty_segment_and_leaves_no_stray_file(
     hass = _Hass()
     writer1 = ring_clip.RingClipWriter(hass, tmp_path, "clip")
     writer1.on_video(_rtp(1, b"\x67SPS"))
-    writer1.on_video(_rtp(2, b"\x65IDR1"))
+    writer1.on_video(_rtp(2, b"\x65\x88IDR1"))
     writer1.close()
 
     # A continuation writer that never received any video (e.g. the
@@ -496,7 +524,7 @@ def test_finalize_clamps_fps_to_sane_range(
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
     for seq in range(1, 22):
-        writer.on_video(_rtp(seq, bytes([0x65, seq])))
+        writer.on_video(_rtp(seq, bytes([0x65, 0x88, seq])))
 
     captured: dict[str, object] = {}
     process = _FakeProcess(returncode=0)
@@ -522,7 +550,7 @@ def test_finalize_is_cancellable_and_kills_the_ffmpeg_process(
 ) -> None:
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
-    writer.on_video(_rtp(1, b"\x65IDR"))
+    writer.on_video(_rtp(1, b"\x65\x88IDR"))
 
     process = _FakeProcess(returncode=0)
     blocked = asyncio.Event()
@@ -771,7 +799,7 @@ def test_capture_ring_clip_happy_path_fires_event_and_clears_in_flight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_ffmpeg_success(monkeypatch)
-    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
     entry_data = _entry_data(coordinator, "station1")
     hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
     entry = _FakeConfigEntry(
@@ -801,7 +829,7 @@ def test_capture_ring_clip_fires_event_even_when_body_raises(
     """
     _patch_ffmpeg_success(monkeypatch)
     coordinator = _FakeStationCoordinator(
-        packets=[_rtp(1, b"\x65IDR")],
+        packets=[_rtp(1, b"\x65\x88IDR")],
         open_error=RuntimeError("SIP dial blew up"),
     )
     entry_data = _entry_data(coordinator, "station1")
@@ -848,7 +876,7 @@ def test_capture_ring_clip_ring_reason_skips_when_station_already_capturing(
 ) -> None:
     """DEFECT 4: a second _on_ring for the same station must not race it."""
     _patch_ffmpeg_success(monkeypatch)
-    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
     entry_data = _entry_data(coordinator, "station1")
     entry_data["ring_clip_in_flight_stations"] = {"station1"}
     hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
@@ -870,7 +898,7 @@ def test_capture_ring_clip_service_reason_raises_when_station_already_capturing(
 ) -> None:
     """DEFECT 4: the record_clip service must not silently corrupt a run."""
     _patch_ffmpeg_success(monkeypatch)
-    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
     entry_data = _entry_data(coordinator, "station1")
     entry_data["ring_clip_in_flight_stations"] = {"station1"}
     hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
@@ -893,8 +921,8 @@ def test_capture_ring_clip_service_reason_allowed_for_a_different_station(
 ) -> None:
     """The guard is per-station: a busy station must not block another."""
     _patch_ffmpeg_success(monkeypatch)
-    busy_coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
-    free_coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    busy_coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
+    free_coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
     entry_data = {
         "stream_coordinators": {
             ("station1", 0): busy_coordinator,
@@ -934,9 +962,9 @@ def test_finalize_excludes_the_dead_gap_between_segments_from_fps(
     first = ring_clip.RingClipWriter(hass, tmp_path, "clip")
     second = ring_clip.RingClipWriter(hass, tmp_path, "clip.part2")
     for seq, writer in ((1, first), (2, first), (3, first)):
-        writer.on_video(_rtp(seq, bytes([0x65, seq])))
+        writer.on_video(_rtp(seq, bytes([0x65, 0x88, seq])))
     for seq, writer in ((1, second), (2, second), (3, second)):
-        writer.on_video(_rtp(seq, bytes([0x65, seq])))
+        writer.on_video(_rtp(seq, bytes([0x65, 0x88, seq])))
 
     captured: dict[str, object] = {}
     process = _FakeProcess(returncode=0)
