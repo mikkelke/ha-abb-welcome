@@ -321,7 +321,16 @@ class RingClipWriter:
         self.nals += 1
         self.bytes_written += len(chunk)
         if (nal[0] & 0x1F) in (_NAL_TYPE_NON_IDR_SLICE, _NAL_TYPE_IDR_SLICE):
-            self.frames += 1
+            # Count pictures, not slices. ABB stations send a picture as
+            # several slice NALs (measured: 5.94 per picture on an M22403-W),
+            # so counting every slice inflated the frame rate ~6x - a 13.0 s
+            # doorstep event came out as a 1.77 s mp4 that played back at
+            # roughly 6x speed. A slice starts a new picture iff its
+            # first_mb_in_slice is 0, and that field is the first ue(v) in the
+            # slice header: ue(v) encodes 0 as a single 1 bit, so the test is
+            # exactly "the top bit of the first RBSP byte is set".
+            if len(nal) > 1 and nal[1] & 0x80:
+                self.frames += 1
         if self.first_wall_time is None:
             self.first_wall_time = now
         self.last_wall_time = now
