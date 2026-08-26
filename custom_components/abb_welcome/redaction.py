@@ -73,7 +73,14 @@ _SAFE_STATUS_VALUES = {
     "play",
     "post",
     "put",
+    "acl_parse_failed",
+    "acl_timeout",
+    "connection_reset",
+    "listener_disconnected",
+    "listener_stopped",
+    "local_bye",
     "registered",
+    "remote_bye",
     "rtp/avp",
     "rtp/avpf",
     "setup",
@@ -97,6 +104,12 @@ _IPV6_RE = re.compile(
     r"[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"
 )
 _SIP_RE = re.compile(r"sip:[^\s@;>]+@[^\s;>]+", re.IGNORECASE)
+# The STATUS CODE of a SIP response is a protocol constant and is the whole
+# diagnostic value of a response line. The reason phrase after it is NOT: RFC
+# 3261 lets the far end put arbitrary text there, so it can carry anything.
+# Match the code and drop the rest. Request start lines ("INVITE sip:x@y
+# SIP/2.0") carry the target URI, hence the anchor at SIP/2.0.
+_SIP_RESPONSE_CODE_RE = re.compile(r"^SIP/2\.0\s+(\d{3})\b")
 _PEM_RE = re.compile(
     r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", re.DOTALL
 )
@@ -198,6 +211,14 @@ class ABBWelcomeRedactionFilter(logging.Filter):
             return redact_log_value(value)
         if isinstance(value, str) and value.lower() in _SAFE_STATUS_VALUES:
             return value
+        if isinstance(value, str):
+            # Without this, "why did the dial fail?" is unanswerable: the
+            # dialer logs frame.start_line, and a blanked response is the
+            # whole answer thrown away. Keep the code, drop the free-text
+            # reason phrase the far end controls.
+            response = _SIP_RESPONSE_CODE_RE.match(value.strip())
+            if response is not None:
+                return f"SIP/2.0 {response.group(1)}"
         if _is_numeric_container(value):
             # Counter and timing dicts carry no identifiers, and blanking them
             # makes the diagnostic they exist for useless: the talkback stats
