@@ -779,12 +779,18 @@ class _FakeStationCoordinator:
         *,
         packets: list[bytes] | None = None,
         open_error: Exception | None = None,
+        open_results: list[bool] | None = None,
     ) -> None:
         self._packets = packets or []
         self._open_error = open_error
+        # One entry per async_open_for_ring call: False models the real
+        # coordinator's "logged the failure, returning False" path, which
+        # never raises. Exhausted list -> True (the default happy path).
+        self._open_results = list(open_results or [])
         self._sink = None
         self._call_ended_callbacks: list = []
         self.opened = False
+        self.open_calls = 0
 
     def add_packet_sink(self, sink: object) -> None:
         self._sink = sink
@@ -800,15 +806,19 @@ class _FakeStationCoordinator:
         if callback in self._call_ended_callbacks:
             self._call_ended_callbacks.remove(callback)
 
-    async def async_open_for_ring(self) -> None:
+    async def async_open_for_ring(self) -> bool:
         self.opened = True
-        if self._sink is not None:
+        self.open_calls += 1
+        opened = self._open_results.pop(0) if self._open_results else True
+        if opened and self._sink is not None:
             for packet in self._packets:
                 self._sink.on_video(packet)
         if self._open_error is not None:
             raise self._open_error
-        for call_ended_callback in list(self._call_ended_callbacks):
-            call_ended_callback("call-id", "bye")
+        if opened:
+            for call_ended_callback in list(self._call_ended_callbacks):
+                call_ended_callback("call-id", "bye")
+        return opened
 
 
 def _patch_ffmpeg_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1016,3 +1026,104 @@ def test_finalize_excludes_the_dead_gap_between_segments_from_fps(
     # not the 6.0s window, so playback runs at true speed.
     assert result.fps == pytest.approx(3.0)
     assert captured["args"][captured["args"].index("-r") + 1] == "3.0"
+
+
+# --------------------------------------------------------------------------- #
+# Continuation redial: retry instead of giving up after one attempt
+# --------------------------------------------------------------------------- #
+
+
+def _no_redial_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the retry timing out of the test's wall clock."""
+    monkeypatch.setattr(capture, "_RING_CLIP_REDIAL_DELAY_S", 0)
+    monkeypatch.setattr(capture, "_RING_CLIP_REDIAL_RETRY_DELAY_S", 0)
+
+
+def _continuation_entry(tmp_path: Path) -> "_FakeConfigEntry":
+    return _FakeConfigEntry(
+        options={
+            capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips"),
+            capture.CONF_RING_CLIP_CONTINUE_AFTER_HANGUP: True,
+            "ring_clip_seconds": 30,
+        }
+    )
+
+
+def test_failed_media_open_does_not_burn_the_recording_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """async_open_for_ring reports failure by return value, never by raising.
+
+    Ignoring it meant a failed open still sat out the whole max_seconds
+    waiting for packets that could not arrive - measured on a live back-door
+    ring as ten seconds of nothing.
+    """
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")], open_results=[False]
+    )
+    writer = ring_clip.RingClipWriter(_Hass(), tmp_path, "clip")
+
+    waited = {"called": False}
+
+    async def _never(*_args, **_kwargs):
+        waited["called"] = True
+
+    monkeypatch.setattr(capture, "_wait_for_first", _never)
+    call_ended, opened = asyncio.run(
+        capture._record_ring_segment(
+            coordinator, writer, max_seconds=30, stop_events=(asyncio.Event(),)
+        )
+    )
+
+    assert opened is False
+    assert call_ended is False
+    assert waited["called"] is False, "must not wait for packets that cannot come"
+
+
+def test_continuation_retries_until_a_segment_captures_something(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The back door's ring call is ~1.45s, so the first redial lands while
+    the station is still tearing down. One attempt was the whole budget."""
+    _patch_ffmpeg_success(monkeypatch)
+    _no_redial_delay(monkeypatch)
+    # ring call opens, first continuation attempt fails, second succeeds.
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")], open_results=[True, False, True]
+    )
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+
+    asyncio.run(
+        capture._capture_ring_clip(hass, _continuation_entry(tmp_path), "station1")
+    )
+
+    assert coordinator.open_calls == 3, "should have retried the failed redial"
+    _event_type, payload = hass.bus.fired[0]
+    assert payload["ok"] is True
+    # The empty attempt is dropped by finalize, so only real segments count.
+    assert payload["segments"] == 2
+
+
+def test_continuation_gives_up_after_the_attempt_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A station that never comes back must not retry forever."""
+    _patch_ffmpeg_success(monkeypatch)
+    _no_redial_delay(monkeypatch)
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")],
+        open_results=[True] + [False] * 10,
+    )
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+
+    asyncio.run(
+        capture._capture_ring_clip(hass, _continuation_entry(tmp_path), "station1")
+    )
+
+    assert coordinator.open_calls == 1 + capture._RING_CLIP_REDIAL_ATTEMPTS
+    # The ring segment itself still produced a clip.
+    _event_type, payload = hass.bus.fired[0]
+    assert payload["ok"] is True
+    assert payload["segments"] == 1

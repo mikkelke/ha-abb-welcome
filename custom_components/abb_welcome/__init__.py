@@ -224,6 +224,13 @@ EVENT_RING_CLIP = f"{DOMAIN}_ring_clip"
 # Mandatory settle time before re-dialing for a continuation segment.
 # Measured live: immediate re-dials return zero video and get BYE'd.
 _RING_CLIP_REDIAL_DELAY_S = 2.5
+# The station can still be tearing down its own call when the first redial
+# lands, which is how the back door lost every clip: its ring call is only
+# ~1.45 s (vs ~5.5 s at the front), so the redial arrives while the station is
+# still busy and a single attempt was the whole budget. Dialling the same
+# station on demand a minute later works fine, so this is timing, not capability.
+_RING_CLIP_REDIAL_RETRY_DELAY_S = 2.0
+_RING_CLIP_REDIAL_ATTEMPTS = 3
 
 
 def _fire_discovery_changed(
@@ -357,8 +364,16 @@ async def _record_ring_segment(
     *,
     max_seconds: float,
     stop_events: tuple[asyncio.Event, ...],
-) -> bool:
-    """Record one segment onto ``writer``; return whether the call ended."""
+) -> tuple[bool, bool]:
+    """Record one segment onto ``writer``.
+
+    Returns ``(call_ended, media_opened)``. ``async_open_for_ring`` never
+    raises - it logs and reports failure through its return value - and
+    ignoring that meant a failed open still sat out the whole ``max_seconds``
+    waiting for packets that could not arrive. Measured on a back-door ring:
+    the open failed at 10:19:58.567 and the clip finished at 10:20:08.569,
+    ten seconds of nothing.
+    """
     call_ended = asyncio.Event()
 
     def _on_call_ended(_call_id: str, _reason: str) -> None:
@@ -367,12 +382,13 @@ async def _record_ring_segment(
     coordinator.add_packet_sink(writer)
     coordinator.add_call_ended_callback(_on_call_ended)
     try:
-        await coordinator.async_open_for_ring()
-        await _wait_for_first(max_seconds, call_ended, *stop_events)
+        opened = await coordinator.async_open_for_ring()
+        if opened:
+            await _wait_for_first(max_seconds, call_ended, *stop_events)
     finally:
         coordinator.remove_call_ended_callback(_on_call_ended)
         coordinator.remove_packet_sink(writer)
-    return call_ended.is_set()
+    return call_ended.is_set(), opened
 
 
 def _ring_clip_public_url(hass: HomeAssistant, target_dir: Path, filename: str) -> str:
@@ -497,7 +513,7 @@ async def _capture_ring_clip(
 
         extra_segments: list[RingClipWriter] = []
         try:
-            call_ended = await _record_ring_segment(
+            call_ended, _opened = await _record_ring_segment(
                 coordinator, writer, max_seconds=seconds, stop_events=(unload_event,)
             )
 
@@ -515,16 +531,19 @@ async def _capture_ring_clip(
                 and writer.elapsed_s < seconds
             ):
                 remaining = seconds - writer.elapsed_s
-                await asyncio.sleep(_RING_CLIP_REDIAL_DELAY_S)
-                if not unload_event.is_set():
+                delay = _RING_CLIP_REDIAL_DELAY_S
+                for attempt in range(1, _RING_CLIP_REDIAL_ATTEMPTS + 1):
+                    await asyncio.sleep(delay)
+                    if unload_event.is_set() or remaining <= 0:
+                        break
                     # Same clock as RingClipWriter.first_wall_time (wall
                     # time, not monotonic) — first_wall_time also anchors
                     # the fired event's started_at, so it cannot switch
                     # clocks without corrupting that timestamp too.
                     wait_started = time.time()
                     try:
-                        writer2 = RingClipWriter(
-                            hass, target_dir, f"{base_name}.part2"
+                        writer_n = RingClipWriter(
+                            hass, target_dir, f"{base_name}.part{attempt + 1}"
                         )
                     except (ValueError, PermissionError, OSError) as err:
                         _LOGGER.error(
@@ -533,21 +552,40 @@ async def _capture_ring_clip(
                             station_id,
                             err,
                         )
-                    else:
-                        await _record_ring_segment(
-                            coordinator,
-                            writer2,
-                            max_seconds=remaining,
-                            stop_events=(unload_event,),
-                        )
-                        if writer2.first_wall_time is not None:
+                        break
+                    _, opened = await _record_ring_segment(
+                        coordinator,
+                        writer_n,
+                        max_seconds=remaining,
+                        stop_events=(unload_event,),
+                    )
+                    # Empty segments are dropped by finalize(), so a failed
+                    # attempt costs nothing but the time it took.
+                    extra_segments.append(writer_n)
+                    if writer_n.bytes_written > 0:
+                        if writer_n.first_wall_time is not None:
                             _LOGGER.info(
                                 "[abb] ring clip: continuation wait->first-frame "
-                                "delta=%.3fs station=%s",
-                                writer2.first_wall_time - wait_started,
+                                "delta=%.3fs station=%s attempt=%d",
+                                writer_n.first_wall_time - wait_started,
                                 station_id,
+                                attempt,
                             )
-                        extra_segments.append(writer2)
+                        break
+                    remaining -= time.time() - wait_started
+                    if attempt < _RING_CLIP_REDIAL_ATTEMPTS and remaining > 0:
+                        _LOGGER.info(
+                            "[abb] ring clip: continuation attempt %d/%d captured "
+                            "nothing for station=%s (media_opened=%s), retrying in "
+                            "%.1fs with %.1fs of budget left",
+                            attempt,
+                            _RING_CLIP_REDIAL_ATTEMPTS,
+                            station_id,
+                            opened,
+                            _RING_CLIP_REDIAL_RETRY_DELAY_S,
+                            remaining,
+                        )
+                    delay = _RING_CLIP_REDIAL_RETRY_DELAY_S
         except Exception:  # the clip must still be finalized below
             _LOGGER.exception(
                 "[abb] ring clip: capture failed unexpectedly station=%s",
