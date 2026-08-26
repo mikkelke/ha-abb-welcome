@@ -68,3 +68,34 @@ def test_empty_container_stays_conservative() -> None:
 def test_non_sensitive_message_is_untouched() -> None:
     stats = {"packets": 1}
     assert _filtered("[abb] counters %s", (stats,)) == {"packets": 1}
+
+
+def test_sip_response_code_survives_without_its_reason_phrase() -> None:
+    """The code answers "why did the dial fail?"; the phrase is far-end free text."""
+    args = _filtered("[abb] dialer: inbound SIP response %s cseq=%s", ("SIP/2.0 486 Busy Here", "2 INVITE"))
+    assert args[0] == "SIP/2.0 486"
+
+
+def test_reason_phrase_cannot_smuggle_private_text() -> None:
+    """RFC 3261 lets the far end put anything in the reason phrase."""
+    args = _filtered("BYE result for %s: %s", ("station", "SIP/2.0 200 private-call"))
+    assert "private-call" not in str(args[1])
+
+
+def test_sip_request_start_line_is_still_redacted() -> None:
+    """Request lines carry the target URI and must keep being blanked."""
+    args = _filtered(
+        "[abb] dialer: outbound SIP %s", ("INVITE sip:100000001@ipgw8ce6d3c51e10 SIP/2.0", "x")
+    )
+    assert args[0] == redaction.REDACTED
+
+
+def test_call_end_reason_label_survives() -> None:
+    args = _filtered("[abb] media: incoming call ended by SIP dialog reason=%s", ("remote_bye", "x"))
+    assert args[0] == "remote_bye"
+
+
+def test_a_sip_uri_smuggled_into_a_response_line_is_redacted() -> None:
+    """The anchored pattern must not become a bypass."""
+    args = _filtered("[abb] dialer: %s", ("SIP/2.0 200 OK sip:100000001@gateway", "x"))
+    assert "100000001" not in str(args[0])
