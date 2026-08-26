@@ -136,6 +136,25 @@ def redact_log_value(value: Any, key: str | None = None) -> Any:
     return value
 
 
+def _is_numeric_container(value: Any) -> bool:
+    """Whether ``value`` is a dict/list/tuple holding only numeric scalars.
+
+    Booleans, ints, floats and None cannot encode an address, key or
+    identifier, so a container of nothing else is safe to log verbatim even in
+    a sensitive context. Empty containers are not treated as numeric - there
+    is nothing to preserve and blanking them stays conservative.
+    """
+    if isinstance(value, dict):
+        items: Any = list(value.values())
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return False
+    if not items:
+        return False
+    return all(item is None or isinstance(item, (bool, int, float)) for item in items)
+
+
 class ABBWelcomeRedactionFilter(logging.Filter):
     """Sanitize every record created by an ABB Welcome module logger."""
 
@@ -179,6 +198,15 @@ class ABBWelcomeRedactionFilter(logging.Filter):
             return redact_log_value(value)
         if isinstance(value, str) and value.lower() in _SAFE_STATUS_VALUES:
             return value
+        if _is_numeric_container(value):
+            # Counter and timing dicts carry no identifiers, and blanking them
+            # makes the diagnostic they exist for useless: the talkback stats
+            # line is redacted purely because the word "talkback" appears in
+            # its own message template, so packet counts, underruns and send
+            # errors were unreadable exactly when someone was debugging them.
+            return {
+                redact_log_value(key): item for key, item in value.items()
+            } if isinstance(value, dict) else value
         if isinstance(value, (str, dict, list, tuple, BaseException)):
             return REDACTED
         return redact_log_value(value)
