@@ -33,6 +33,7 @@ from .const import (
     CONF_LAN_RTSP_PROXY,
     CONF_RECORD_RING_CLIPS,
     CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
     CONF_RING_CLIP_DIR,
     CONF_TALKBACK_OUTPUT_GAIN_DB,
     CONF_UNLOCK_STRATEGY,
@@ -43,6 +44,7 @@ from .const import (
     DEFAULT_LAN_RTSP_PROXY,
     DEFAULT_RECORD_RING_CLIPS,
     DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
     DEFAULT_RING_CLIP_DIR,
     DOMAIN,
     EVENT_DISCOVERY_CHANGED,
@@ -366,6 +368,7 @@ async def _record_ring_segment(
     *,
     max_seconds: float,
     stop_events: tuple[asyncio.Event, ...],
+    prefer_dial: bool = False,
 ) -> tuple[bool, bool]:
     """Record one segment onto ``writer``.
 
@@ -384,7 +387,17 @@ async def _record_ring_segment(
     coordinator.add_packet_sink(writer)
     coordinator.add_call_ended_callback(_on_call_ended)
     try:
-        opened = await coordinator.async_open_for_ring()
+        opened = await coordinator.async_open_for_ring(prefer_dial=prefer_dial)
+        if not opened and prefer_dial:
+            # Glare: the station has an INVITE outstanding to us, so it may
+            # refuse ours. Answering it still gets the video even though that
+            # call will not carry an audible announcement - a silent clip beats
+            # no clip.
+            _LOGGER.info(
+                "[abb] ring clip: outbound dial refused, answering the "
+                "station's own call instead (announcement will be silent)"
+            )
+            opened = await coordinator.async_open_for_ring(prefer_dial=False)
         if opened:
             await _wait_for_first(max_seconds, call_ended, *stop_events)
     finally:
@@ -515,8 +528,21 @@ async def _capture_ring_clip(
 
         extra_segments: list[RingClipWriter] = []
         try:
+            # An announcement is only worth anything BEFORE the door opens, and
+            # the station will not play one on a call it originated - so for a
+            # ring, place our own call instead of answering its.
+            prefer_dial = reason == "ring" and bool(
+                entry.options.get(
+                    CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
+                    DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
+                )
+            )
             call_ended, _opened = await _record_ring_segment(
-                coordinator, writer, max_seconds=seconds, stop_events=(unload_event,)
+                coordinator,
+                writer,
+                max_seconds=seconds,
+                stop_events=(unload_event,),
+                prefer_dial=prefer_dial,
             )
 
             continue_after_hangup = bool(
