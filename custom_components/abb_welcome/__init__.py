@@ -1683,7 +1683,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 ) from err
 
             try:
-                await announce(pcm, talkback_session_id)
+                stats = await announce(pcm, talkback_session_id)
             except HomeAssistantError:
                 raise
             except (OSError, RuntimeError, ValueError) as err:
@@ -1691,6 +1691,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     "Unable to play the unattended announcement; the selected "
                     "station may already be in use"
                 ) from err
+            # send_temporary_talkback_pcm16le_audio returns send counters and
+            # this discarded them, so a completely silent announcement was
+            # indistinguishable from a working one - the service returns None
+            # either way. The counters are numbers only, no identifiers.
+            _LOGGER.info(
+                "[abb] announce sent %d PCM bytes, sender reported: %s",
+                len(pcm),
+                stats,
+            )
 
         hass.services.async_register(
             DOMAIN,
