@@ -1156,8 +1156,16 @@ class StreamSession:
             self._fir_requests_sent += 1
         return True
 
-    async def open(self) -> None:
-        """Dial gateway and start receiving RTP."""
+    async def open(self, *, prefer_dial: bool = False) -> None:
+        """Dial gateway and start receiving RTP.
+
+        ``prefer_dial`` skips answering a pending incoming call and places our
+        own outbound one instead. That matters for audio, not for video: the
+        station does not render talkback on a call it originated (measured:
+        clean RTP, zero send errors, repeated human nulls at the door) but does
+        on one Home Assistant dialled. An announcement is only worth anything
+        before the door opens, so it has to ride a call of the second kind.
+        """
         loop = asyncio.get_running_loop()
         self._accepted_incoming_call_id = None
         self._accepted_incoming_ack_received = None
@@ -1182,9 +1190,13 @@ class StreamSession:
         offer_video_port = self._video_sock.getsockname()[1]
 
         try:
-            call = await self._accept_incoming_call_if_pending(
-                audio_port=offer_audio_port,
-                video_port=offer_video_port,
+            call = (
+                None
+                if prefer_dial
+                else await self._accept_incoming_call_if_pending(
+                    audio_port=offer_audio_port,
+                    video_port=offer_video_port,
+                )
             )
             accepted_incoming = call is not None
             if call is None:

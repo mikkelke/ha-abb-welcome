@@ -76,6 +76,11 @@ DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP = False
 # CONF_RECORD_RING_CLIPS above) to a subset of an entry's stations. Empty or
 # absent means every station records, i.e. today's entry-wide behavior.
 CONF_RING_CLIP_STATIONS = "ring_clip_stations"
+# Place our own call on a ring instead of answering the station's. The station
+# will not play talkback on a call it originated, so an announcement that has
+# to be heard BEFORE the door opens cannot ride the incoming call at all.
+CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER = "ring_clip_dial_instead_of_answer"
+DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER = False
 DEFAULT_RING_CLIP_STATIONS: tuple[str, ...] = ()
 
 # Per-integration option: which unlock strategy to use.
