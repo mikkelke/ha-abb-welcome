@@ -386,7 +386,14 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             return self._data
 
         except requests.RequestException as err:
-            _LOGGER.warning(_LOG + "Event poll failed: %s", err)
+            # The redaction filter blanks every *string argument* under a message that
+            # mentions "event", so "%s" % err logged nothing but "<redacted>" - a poll
+            # outage on 2026-08-30 ran six hours unreadable. The exception class and the
+            # HTTP status name no part of an installation, so they go in the message
+            # itself, where the filter's pattern rules (host, UUID, IP) still apply.
+            status = getattr(getattr(err, "response", None), "status_code", None)
+            detail = type(err).__name__ + (f" HTTP {status}" if status else "")
+            _LOGGER.warning(_LOG + "Event poll failed: " + detail)
             return self._data
         finally:
             session.close()
