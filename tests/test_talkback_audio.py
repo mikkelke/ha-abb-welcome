@@ -434,3 +434,56 @@ def test_pcm_playback_pads_frames_and_rejects_busy(monkeypatch) -> None:
         assert not sender.talking
 
     asyncio.run(_cancel_playback())
+
+
+def test_talkback_audible_reflects_who_originated_the_call() -> None:
+    """The station only renders talkback on a call Home Assistant dialled -
+    never on its own call, e.g. one we answered after losing a dial glare."""
+    intercom_name = "abb_welcome.intercom_dialer"
+    pkg = sys.modules.setdefault("abb_welcome", types.ModuleType("abb_welcome"))
+    pkg.__path__ = [str(_PKG_DIR)]
+    for name in (intercom_name, "abb_welcome.media_pipeline"):
+        sys.modules.pop(name, None)
+    intercom_spec = importlib.util.spec_from_file_location(
+        intercom_name, _PKG_DIR / "intercom_dialer.py"
+    )
+    intercom = importlib.util.module_from_spec(intercom_spec)
+    sys.modules[intercom_name] = intercom
+    intercom_spec.loader.exec_module(intercom)
+    media_spec = importlib.util.spec_from_file_location(
+        "abb_welcome.media_pipeline", _PKG_DIR / "media_pipeline.py"
+    )
+    media = importlib.util.module_from_spec(media_spec)
+    sys.modules[media_spec.name] = media
+    media_spec.loader.exec_module(media)
+    session = media.StreamSession(
+        dialer=object(),
+        door=intercom.Door("door", "address"),
+        gateway_host="192.0.2.1",
+    )
+    session._talk_sender = types.SimpleNamespace(
+        active=True, stats=lambda: {"talking": False}
+    )
+
+    # Talkback hardware is ready but no call is up: never station-originated.
+    assert session.talkback_ready is True
+    assert session.call_is_station_originated is False
+    assert session.talkback_audible is True
+
+    # The station put this call up itself (e.g. we answered it on a glare):
+    # ready, but the outdoor station renders no audio on it.
+    session._call = object()
+    session._accepted_incoming_call_id = "incoming-call-id"
+    assert session.call_is_station_originated is True
+    assert session.talkback_audible is False
+    stats = session.talkback_stats()
+    assert stats["audible"] is False
+    assert stats["call_origin"] == "answered"
+
+    # The same call, but Home Assistant dialled it: audible again.
+    session._accepted_incoming_call_id = None
+    assert session.call_is_station_originated is False
+    assert session.talkback_audible is True
+    stats = session.talkback_stats()
+    assert stats["audible"] is True
+    assert stats["call_origin"] == "dialed"

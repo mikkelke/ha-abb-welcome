@@ -1064,6 +1064,14 @@ class StreamSession:
     def talkback_ready(self) -> bool:
         return self._talk_sender is not None and self._talk_sender.active
 
+    @property
+    def call_is_station_originated(self) -> bool:
+        return self._call is not None and self._accepted_incoming_call_id is not None
+
+    @property
+    def talkback_audible(self) -> bool:
+        return self.talkback_ready and not self.call_is_station_originated
+
     def talkback_stats(self) -> dict[str, Any]:
         sender = self._talk_sender
         if sender is None:
@@ -1072,8 +1080,18 @@ class StreamSession:
                 "talking": False,
                 "gain_db": self._talkback_output_gain_db,
                 "limited_frames": 0,
+                "audible": False,
+                "call_origin": self._call_origin(),
             }
-        return sender.stats()
+        stats = sender.stats()
+        stats["audible"] = self.talkback_audible
+        stats["call_origin"] = self._call_origin()
+        return stats
+
+    def _call_origin(self) -> str:
+        if self._call is None:
+            return ""
+        return "answered" if self._accepted_incoming_call_id is not None else "dialed"
 
     def set_packet_handlers(
         self,
