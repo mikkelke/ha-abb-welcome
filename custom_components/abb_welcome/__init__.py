@@ -236,6 +236,14 @@ _RING_CLIP_REDIAL_DELAY_S = 2.5
 _RING_CLIP_REDIAL_RETRY_DELAY_S = 2.0
 _RING_CLIP_REDIAL_ATTEMPTS = 3
 
+# How long to hold the station's own (silent, glare-answered) ring call open
+# for ring-moment video before we hang it up ourselves so the redial can
+# bring up a call we actually dialled. 3.0s gives ~1.3s of video after the
+# measured 1.67s establish->first-frame delay.
+_RING_CLIP_GLARE_HOLD_S = 3.0
+# Cap on the hold while nothing has arrived yet.
+_RING_CLIP_GLARE_HOLD_MAX_S = 4.5
+
 
 def _fire_discovery_changed(
     hass: HomeAssistant,
@@ -369,15 +377,21 @@ async def _record_ring_segment(
     max_seconds: float,
     stop_events: tuple[asyncio.Event, ...],
     prefer_dial: bool = False,
-) -> tuple[bool, bool]:
+    glare_hold_s: float | None = None,
+) -> tuple[bool, bool, bool]:
     """Record one segment onto ``writer``.
 
-    Returns ``(call_ended, media_opened)``. ``async_open_for_ring`` never
-    raises - it logs and reports failure through its return value - and
+    Returns ``(call_ended, media_opened, self_closed)``. ``async_open_for_ring``
+    never raises - it logs and reports failure through its return value - and
     ignoring that meant a failed open still sat out the whole ``max_seconds``
     waiting for packets that could not arrive. Measured on a back-door ring:
     the open failed at 10:19:58.567 and the clip finished at 10:20:08.569,
     ten seconds of nothing.
+
+    ``glare_hold_s``, when set, bounds how long a glare-answered call (see
+    below) is held open for video before we hang it up ourselves so the
+    caller's redial can bring up a call that can actually carry an
+    announcement.
     """
     call_ended = asyncio.Event()
 
@@ -386,8 +400,10 @@ async def _record_ring_segment(
 
     coordinator.add_packet_sink(writer)
     coordinator.add_call_ended_callback(_on_call_ended)
+    self_closed = False
     try:
         opened = await coordinator.async_open_for_ring(prefer_dial=prefer_dial)
+        glare_answered = False
         if not opened and prefer_dial:
             # Glare: the station has an INVITE outstanding to us, so it may
             # refuse ours. Answering it still gets the video even though that
@@ -398,12 +414,37 @@ async def _record_ring_segment(
                 "station's own call instead (announcement will be silent)"
             )
             opened = await coordinator.async_open_for_ring(prefer_dial=False)
+            glare_answered = opened
         if opened:
-            await _wait_for_first(max_seconds, call_ended, *stop_events)
+            if glare_answered and glare_hold_s is not None:
+                elapsed = min(max_seconds, glare_hold_s)
+                await _wait_for_first(elapsed, call_ended, *stop_events)
+                while (
+                    writer.bytes_written == 0
+                    and not call_ended.is_set()
+                    and not any(event.is_set() for event in stop_events)
+                    and elapsed < _RING_CLIP_GLARE_HOLD_MAX_S
+                ):
+                    step = min(0.5, _RING_CLIP_GLARE_HOLD_MAX_S - elapsed)
+                    await _wait_for_first(step, call_ended, *stop_events)
+                    elapsed += step
+                if not call_ended.is_set() and not any(
+                    event.is_set() for event in stop_events
+                ):
+                    self_closed = await coordinator.async_close_media()
+                    if self_closed:
+                        _LOGGER.info(
+                            "[abb] ring clip: hung up the station's own "
+                            "silent call after %.1fs so a dialled call can "
+                            "carry the announcement",
+                            elapsed,
+                        )
+            else:
+                await _wait_for_first(max_seconds, call_ended, *stop_events)
     finally:
         coordinator.remove_call_ended_callback(_on_call_ended)
         coordinator.remove_packet_sink(writer)
-    return call_ended.is_set(), opened
+    return call_ended.is_set(), opened, self_closed
 
 
 def _ring_clip_public_url(hass: HomeAssistant, target_dir: Path, filename: str) -> str:
@@ -537,12 +578,13 @@ async def _capture_ring_clip(
                     DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
                 )
             )
-            call_ended, _opened = await _record_ring_segment(
+            call_ended, _opened, self_closed = await _record_ring_segment(
                 coordinator,
                 writer,
                 max_seconds=seconds,
                 stop_events=(unload_event,),
                 prefer_dial=prefer_dial,
+                glare_hold_s=_RING_CLIP_GLARE_HOLD_S,
             )
 
             continue_after_hangup = bool(
@@ -553,8 +595,8 @@ async def _capture_ring_clip(
             )
             if (
                 reason == "ring"
-                and continue_after_hangup
-                and call_ended
+                and (continue_after_hangup or self_closed)
+                and (call_ended or self_closed)
                 and not unload_event.is_set()
                 and writer.elapsed_s < seconds
             ):
@@ -581,11 +623,12 @@ async def _capture_ring_clip(
                             err,
                         )
                         break
-                    _, opened = await _record_ring_segment(
+                    _, opened, _self_closed = await _record_ring_segment(
                         coordinator,
                         writer_n,
                         max_seconds=remaining,
                         stop_events=(unload_event,),
+                        prefer_dial=prefer_dial,
                     )
                     # Empty segments are dropped by finalize(), so a failed
                     # attempt costs nothing but the time it took.
@@ -1600,6 +1643,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     raise HomeAssistantError(
                         "Selected camera does not support talkback"
                     )
+                if not bool(getattr(camera, "talkback_audible", True)):
+                    raise HomeAssistantError(
+                        "The outdoor station does not render audio on a call "
+                        "it originated; wait for a Home Assistant-dialled call"
+                    )
                 stats = await tone(
                     duration_ms=call.data["duration_ms"],
                     frequency_hz=call.data["frequency_hz"],
@@ -1650,6 +1698,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
             if not bool(getattr(camera, "talkback_ready", False)):
                 raise HomeAssistantError(
                     "Talkback is not ready; open the selected camera stream first"
+                )
+            if not bool(getattr(camera, "talkback_audible", True)):
+                raise HomeAssistantError(
+                    "The outdoor station does not render audio on a call it "
+                    "originated; wait for a Home Assistant-dialled call"
                 )
             pcm = await async_prepare_talkback_audio(
                 hass, media["media_content_id"]

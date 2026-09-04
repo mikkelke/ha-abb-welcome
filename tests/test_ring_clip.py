@@ -790,6 +790,7 @@ class _FakeStationCoordinator:
         packets: list[bytes] | None = None,
         open_error: Exception | None = None,
         open_results: list[bool] | None = None,
+        auto_end: list[bool] | None = None,
     ) -> None:
         self._packets = packets or []
         self._open_error = open_error
@@ -797,11 +798,19 @@ class _FakeStationCoordinator:
         # coordinator's "logged the failure, returning False" path, which
         # never raises. Exhausted list -> True (the default happy path).
         self._open_results = list(open_results or [])
+        # One entry per *successful* open: whether the station hangs the
+        # call up itself (firing the call-ended callbacks), matching
+        # _on_gateway_call_ended. Exhausted list -> True (today's default:
+        # every fake call ends itself immediately). False models a call
+        # nobody hangs up but us - e.g. a glare-answered call, which is
+        # silent and only ends when we call async_close_media ourselves.
+        self._auto_end_results = list(auto_end or [])
         self._sink = None
         self._call_ended_callbacks: list = []
         self.opened = False
         self.open_calls = 0
         self.prefer_dial_calls: list[bool] = []
+        self.close_calls: list[bool] = []
 
     def add_packet_sink(self, sink: object) -> None:
         self._sink = sink
@@ -828,9 +837,17 @@ class _FakeStationCoordinator:
         if self._open_error is not None:
             raise self._open_error
         if opened:
-            for call_ended_callback in list(self._call_ended_callbacks):
-                call_ended_callback("call-id", "bye")
+            ends_itself = (
+                self._auto_end_results.pop(0) if self._auto_end_results else True
+            )
+            if ends_itself:
+                for call_ended_callback in list(self._call_ended_callbacks):
+                    call_ended_callback("call-id", "bye")
         return opened
+
+    async def async_close_media(self) -> bool:
+        self.close_calls.append(True)
+        return True
 
 
 def _patch_ffmpeg_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1129,6 +1146,9 @@ def test_refused_dial_falls_back_to_answering_the_station(
     asyncio.run(capture._capture_ring_clip(hass, entry, "station1"))
 
     assert coordinator.prefer_dial_calls[:2] == [True, False]
+    # The station hung the glare-answered call up itself (the fake's default
+    # auto-end), so our own self-close logic must never have engaged.
+    assert coordinator.close_calls == []
     _event_type, payload = hass.bus.fired[0]
     assert payload["ok"] is True
 
@@ -1153,7 +1173,7 @@ def test_failed_media_open_does_not_burn_the_recording_budget(
         waited["called"] = True
 
     monkeypatch.setattr(capture, "_wait_for_first", _never)
-    call_ended, opened = asyncio.run(
+    call_ended, opened, self_closed = asyncio.run(
         capture._record_ring_segment(
             coordinator, writer, max_seconds=30, stop_events=(asyncio.Event(),)
         )
@@ -1161,7 +1181,79 @@ def test_failed_media_open_does_not_burn_the_recording_budget(
 
     assert opened is False
     assert call_ended is False
+    assert self_closed is False
     assert waited["called"] is False, "must not wait for packets that cannot come"
+
+
+def test_glare_hold_extends_to_the_cap_when_nothing_arrives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No video means the glare-answered call is worth nothing yet, so the
+    hold must keep giving it a chance up to the hard cap - in 0.5s slices."""
+    waits: list[float] = []
+
+    async def _record_wait(timeout: float, *_events: asyncio.Event) -> None:
+        waits.append(timeout)
+
+    monkeypatch.setattr(capture, "_wait_for_first", _record_wait)
+    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_MAX_S", 4.5)
+    # No packets: the glare-answered call never produces any video.
+    coordinator = _FakeStationCoordinator(open_results=[False, True], auto_end=[False])
+    writer = ring_clip.RingClipWriter(_Hass(), tmp_path, "clip")
+
+    call_ended, opened, self_closed = asyncio.run(
+        capture._record_ring_segment(
+            coordinator,
+            writer,
+            max_seconds=30,
+            stop_events=(asyncio.Event(),),
+            prefer_dial=True,
+            glare_hold_s=3.0,
+        )
+    )
+
+    assert opened is True
+    assert call_ended is False
+    assert self_closed is True
+    assert coordinator.close_calls == [True]
+    assert waits == [3.0, 0.5, 0.5, 0.5]
+
+
+def test_glare_hold_stops_at_the_base_hold_once_video_arrives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Video already in hand means the base hold is enough - no need to keep
+    the silent call up any longer than that before handing off to a redial."""
+    waits: list[float] = []
+
+    async def _record_wait(timeout: float, *_events: asyncio.Event) -> None:
+        waits.append(timeout)
+
+    monkeypatch.setattr(capture, "_wait_for_first", _record_wait)
+    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_MAX_S", 4.5)
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")], open_results=[False, True], auto_end=[False]
+    )
+    writer = ring_clip.RingClipWriter(_Hass(), tmp_path, "clip")
+
+    call_ended, opened, self_closed = asyncio.run(
+        capture._record_ring_segment(
+            coordinator,
+            writer,
+            max_seconds=30,
+            stop_events=(asyncio.Event(),),
+            prefer_dial=True,
+            glare_hold_s=3.0,
+        )
+    )
+
+    assert opened is True
+    assert call_ended is False
+    assert self_closed is True
+    assert coordinator.close_calls == [True]
+    assert waits == [3.0]
 
 
 def test_continuation_retries_until_a_segment_captures_something(
@@ -1211,3 +1303,40 @@ def test_continuation_gives_up_after_the_attempt_cap(
     _event_type, payload = hass.bus.fired[0]
     assert payload["ok"] is True
     assert payload["segments"] == 1
+
+
+def test_glare_self_close_runs_continuation_without_the_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A glare-answered call is silent in both directions, so once its
+    ring-moment video is in hand we hang it up ourselves - and that alone
+    must be enough to trigger the continuation redial, even though
+    CONF_RING_CLIP_CONTINUE_AFTER_HANGUP is left unset (off by default)."""
+    _patch_ffmpeg_success(monkeypatch)
+    _no_redial_delay(monkeypatch)
+    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_S", 0.01)
+    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_MAX_S", 0.02)
+    # open#1: our own dial, refused (glare). open#2: the fallback answer,
+    # which the station never hangs up itself - only our own hold/close
+    # logic ends it. open#3: the continuation's own dial, ended normally.
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")],
+        open_results=[False, True, True],
+        auto_end=[False, True],
+    )
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={
+            capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips"),
+            "ring_clip_dial_instead_of_answer": True,
+        }
+    )
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1"))
+
+    assert coordinator.prefer_dial_calls == [True, False, True]
+    assert coordinator.close_calls == [True]
+    _event_type, payload = hass.bus.fired[0]
+    assert payload["ok"] is True
+    assert payload["segments"] == 2

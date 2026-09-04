@@ -164,12 +164,13 @@ class _FakeStreamSession:
     def __init__(self) -> None:
         self.active = False
         self.calls: list[object] = []
+        self.call_is_station_originated = False
 
     def set_packet_handlers(self, *, on_video: object, on_audio: object) -> None:
         self.calls.append(("set_packet_handlers", on_video, on_audio))
 
-    async def open(self) -> None:
-        self.calls.append("open")
+    async def open(self, *, prefer_dial: bool = False) -> None:
+        self.calls.append(("open", prefer_dial))
         self.active = True
 
     async def send_talkback_pcm16le_audio(self, pcm: bytes) -> dict[str, int]:
@@ -227,7 +228,11 @@ def test_temporary_announcement_opens_plays_closes_and_clears_state() -> None:
         assert result == {"packets": 3}
         assert session.calls == [
             ("set_packet_handlers", None, None),
-            "open",
+            # The station never renders talkback on a call it originated, so
+            # an unattended announcement must always dial rather than answer
+            # a pending INVITE - see the send_temporary_talkback regression
+            # this guards against.
+            ("open", True),
             ("play", b"speech"),
             "close",
         ]
@@ -281,8 +286,8 @@ def test_temporary_announcement_refuses_busy_group(
 
 def test_temporary_announcement_open_failure_closes_and_clears_state() -> None:
     class _OpenFailureSession(_FakeStreamSession):
-        async def open(self) -> None:
-            self.calls.append("open")
+        async def open(self, *, prefer_dial: bool = False) -> None:
+            self.calls.append(("open", prefer_dial))
             self.active = True
             raise OSError("SIP open failed")
 
@@ -298,7 +303,7 @@ def test_temporary_announcement_open_failure_closes_and_clears_state() -> None:
 
         assert session.calls == [
             ("set_packet_handlers", None, None),
-            "open",
+            ("open", True),
             "close",
         ]
         assert session.active is False
@@ -340,7 +345,7 @@ def test_cancelling_temporary_announcement_closes_and_clears_state() -> None:
 
         assert session.calls == [
             ("set_packet_handlers", None, None),
-            "open",
+            ("open", True),
             ("play", b"speech"),
             "close",
         ]
@@ -375,5 +380,61 @@ def test_rtsp_attach_is_rejected_and_closed_during_peer_announcement() -> None:
         assert rtsp_session.closed is True
         assert coordinator._rtsp_play_sessions == []
         assert session.calls == [("set_packet_handlers", None, None)]
+
+    asyncio.run(scenario())
+
+
+def test_send_talkback_pcm16le_audio_refuses_a_station_originated_call() -> None:
+    """The outdoor station only ever renders talkback on a call it did not
+    originate itself - a call it answered into is silent in both directions."""
+
+    async def scenario() -> None:
+        session = _FakeStreamSession()
+        session.call_is_station_originated = True
+        coordinator = _coordinator(session)
+
+        with pytest.raises(RuntimeError, match="does not render audio"):
+            await coordinator.send_talkback_pcm16le_audio(b"speech")
+
+        assert session.calls == []
+
+        session.call_is_station_originated = False
+        result = await coordinator.send_talkback_pcm16le_audio(b"speech")
+
+        assert result == {"packets": 3, "owner": ""}
+        assert session.calls == [("play", b"speech")]
+
+    asyncio.run(scenario())
+
+
+def test_async_close_media_leaves_an_attached_rtsp_session_alone() -> None:
+    async def scenario() -> None:
+        session = _FakeStreamSession()
+        session.active = True
+        coordinator = _coordinator(session)
+        coordinator._rtsp_play_sessions.append(object())
+
+        closed = await coordinator.async_close_media()
+
+        assert closed is False
+        assert session.calls == []
+        assert session.active is True
+
+    asyncio.run(scenario())
+
+
+def test_async_close_media_hangs_up_an_active_call() -> None:
+    async def scenario() -> None:
+        session = _FakeStreamSession()
+        session.active = True
+        coordinator = _coordinator(session)
+        state_changes: list[bool] = []
+        coordinator.add_state_callback(lambda: state_changes.append(True))
+
+        closed = await coordinator.async_close_media()
+
+        assert closed is True
+        assert session.calls == ["close"]
+        assert state_changes == [True]
 
     asyncio.run(scenario())

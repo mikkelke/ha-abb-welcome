@@ -435,6 +435,14 @@ class StationStreamCoordinator:
         return self.session.talkback_ready
 
     @property
+    def talkback_audible(self) -> bool:
+        return self.session.talkback_audible
+
+    @property
+    def call_is_station_originated(self) -> bool:
+        return self.session.call_is_station_originated
+
+    @property
     def talkback_owner(self) -> str:
         return self._talkback_owner
 
@@ -781,6 +789,13 @@ class StationStreamCoordinator:
                 session_id,
             )
         self._talkback_owner = session_id
+        if self.session.call_is_station_originated:
+            _LOGGER.warning(
+                "[abb] talkback: station=%s call was station-originated; the "
+                "outdoor station will not render this audio until a Home "
+                "Assistant-dialled call replaces it",
+                self.door.station_id or self.door.address,
+            )
         stats = self.session.start_talkback()
         stats["owner"] = self._talkback_owner
         self._notify_state()
@@ -847,6 +862,11 @@ class StationStreamCoordinator:
             return stats
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
+        if self.session.call_is_station_originated:
+            raise RuntimeError(
+                "the outdoor station does not render audio on a call it "
+                "originated; wait for a Home Assistant-dialled call"
+            )
         stats = await self.session.send_talkback_tone(
             duration_ms=duration_ms,
             frequency_hz=frequency_hz,
@@ -873,6 +893,11 @@ class StationStreamCoordinator:
             return stats
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
+        if self.session.call_is_station_originated:
+            raise RuntimeError(
+                "the outdoor station does not render audio on a call it "
+                "originated; wait for a Home Assistant-dialled call"
+            )
         stats = await self.session.send_talkback_pcm16le_audio(pcm)
         stats["owner"] = self._talkback_owner
         self._notify_state()
@@ -904,7 +929,7 @@ class StationStreamCoordinator:
                     raise RuntimeError(unavailable_reason)
                 self.session.set_packet_handlers(on_video=None, on_audio=None)
                 try:
-                    await self.session.open()
+                    await self.session.open(prefer_dial=True)
                     return await self.session.send_talkback_pcm16le_audio(pcm)
                 finally:
                     if self.session.active:
@@ -914,6 +939,17 @@ class StationStreamCoordinator:
             self._temporary_talkback_active = False
             self._temporary_talkback_task = None
             self._notify_state()
+
+    async def async_close_media(self) -> bool:
+        """Hang up the current call without disturbing sinks or handlers."""
+        if self._rtsp_play_sessions or self._temporary_talkback_active:
+            return False
+        async with self._stream_lock:
+            if not self.session.active:
+                return False
+            await self.session.close()
+        self._notify_state()
+        return True
 
 
 class ABBWelcomeCamera(Camera):
@@ -1016,6 +1052,8 @@ class ABBWelcomeCamera(Camera):
             "snapshot_event_id": snapshot.event_id if snapshot else "",
             "snapshot_station_id": snapshot.station_id if snapshot else "",
             "talkback_ready": self._coordinator.talkback_ready,
+            "talkback_audible": self._coordinator.talkback_audible,
+            "talkback_call_origin": talkback_stats.get("call_origin", ""),
             "talkback_talking": bool(talkback_stats.get("talking")),
             "talkback_packets": int(talkback_stats.get("packets", 0) or 0),
             "talkback_voice_packets": int(
@@ -1397,6 +1435,10 @@ class ABBWelcomeCamera(Camera):
     @property
     def talkback_ready(self) -> bool:
         return self._coordinator.talkback_ready
+
+    @property
+    def talkback_audible(self) -> bool:
+        return self._coordinator.talkback_audible
 
     @property
     def temporary_talkback_active(self) -> bool:

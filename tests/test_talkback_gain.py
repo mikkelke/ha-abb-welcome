@@ -128,4 +128,6 @@ def test_stream_session_reports_configured_gain_before_media_is_open() -> None:
         "talking": False,
         "gain_db": 2.0,
         "limited_frames": 0,
+        "audible": False,
+        "call_origin": "",
     }
