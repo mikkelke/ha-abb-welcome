@@ -29,6 +29,7 @@ from .const import (
     CONF_LAN_RTSP_PORT,
     CONF_RECORD_RING_CLIPS,
     CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
     CONF_RING_CLIP_DIR,
     CONF_RING_CLIP_SECONDS,
     CONF_RING_CLIP_STATIONS,
@@ -38,6 +39,7 @@ from .const import (
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_RECORD_RING_CLIPS,
     DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
     DEFAULT_RING_CLIP_DIR,
     DEFAULT_RING_CLIP_SECONDS,
     DEFAULT_RING_CLIP_STATIONS,
@@ -932,6 +934,17 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                 DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
             )
         )
+        current_ring_clip_dial_instead_of_answer = bool(
+            submitted.get(
+                CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
+                DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
+            )
+            if submitted is not None
+            else self._entry.options.get(
+                CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
+                DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
+            )
+        )
         current_ring_clip_stations = [
             station_id
             for station_id in (
@@ -987,6 +1000,10 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             vol.Required(
                 CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
                 default=current_ring_clip_continue_after_hangup,
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
+                default=current_ring_clip_dial_instead_of_answer,
             ): selector.BooleanSelector(),
         }
         if show_ring_clip_stations:
