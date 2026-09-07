@@ -231,6 +231,11 @@ EVENT_RING_CLIP = f"{DOMAIN}_ring_clip"
 # Mandatory settle time before re-dialing for a continuation segment.
 # Measured live: immediate re-dials return zero video and get BYE'd.
 _RING_CLIP_REDIAL_DELAY_S = 2.5
+# After a hangup WE sent (self_closed), the station has had nothing to tear
+# down on its side, so a shorter settle is tried first; the existing
+# _RING_CLIP_REDIAL_ATTEMPTS loop with _RING_CLIP_REDIAL_RETRY_DELAY_S
+# remains the safety net if it is refused.
+_RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S = 1.0
 # The station can still be tearing down its own call when the first redial
 # lands, which is how the back door lost every clip: its ring call is only
 # ~1.45 s (vs ~5.5 s at the front), so the redial arrives while the station is
@@ -239,13 +244,13 @@ _RING_CLIP_REDIAL_DELAY_S = 2.5
 _RING_CLIP_REDIAL_RETRY_DELAY_S = 2.0
 _RING_CLIP_REDIAL_ATTEMPTS = 3
 
-# How long to hold the station's own (silent, glare-answered) ring call open
-# for ring-moment video before we hang it up ourselves so the redial can
-# bring up a call we actually dialled. 3.0s gives ~1.3s of video after the
-# measured 1.67s establish->first-frame delay.
-_RING_CLIP_GLARE_HOLD_S = 3.0
-# Cap on the hold while nothing has arrived yet.
-_RING_CLIP_GLARE_HOLD_MAX_S = 4.5
+# Flat wait after answering the station's own (silent, glare-answered) ring
+# call, before we hang it up ourselves so the redial can bring up a call we
+# actually dialled — just long enough for the station's ACK to land after
+# our 200 OK. Measured live on 2026-09-07: holding from 3.0s to a 4.5s cap
+# still produced zero frames, and the ring-moment picture is the gateway's
+# own snapshot rather than this video, so holding any longer buys nothing.
+_RING_CLIP_GLARE_HOLD_S = 0.5
 
 
 def _fire_discovery_changed(
@@ -422,15 +427,6 @@ async def _record_ring_segment(
             if glare_answered and glare_hold_s is not None:
                 elapsed = min(max_seconds, glare_hold_s)
                 await _wait_for_first(elapsed, call_ended, *stop_events)
-                while (
-                    writer.bytes_written == 0
-                    and not call_ended.is_set()
-                    and not any(event.is_set() for event in stop_events)
-                    and elapsed < _RING_CLIP_GLARE_HOLD_MAX_S
-                ):
-                    step = min(0.5, _RING_CLIP_GLARE_HOLD_MAX_S - elapsed)
-                    await _wait_for_first(step, call_ended, *stop_events)
-                    elapsed += step
                 if not call_ended.is_set() and not any(
                     event.is_set() for event in stop_events
                 ):
@@ -604,7 +600,11 @@ async def _capture_ring_clip(
                 and writer.elapsed_s < seconds
             ):
                 remaining = seconds - writer.elapsed_s
-                delay = _RING_CLIP_REDIAL_DELAY_S
+                delay = (
+                    _RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S
+                    if self_closed
+                    else _RING_CLIP_REDIAL_DELAY_S
+                )
                 for attempt in range(1, _RING_CLIP_REDIAL_ATTEMPTS + 1):
                     await asyncio.sleep(delay)
                     if unload_event.is_set() or remaining <= 0:
