@@ -1185,21 +1185,32 @@ def test_failed_media_open_does_not_burn_the_recording_budget(
     assert waited["called"] is False, "must not wait for packets that cannot come"
 
 
-def test_glare_hold_extends_to_the_cap_when_nothing_arrives(
+@pytest.mark.parametrize(
+    "packets",
+    [
+        pytest.param([], id="no-video"),
+        pytest.param([_rtp(1, b"\x65\x88IDR")], id="video-arrived"),
+    ],
+)
+def test_glare_hold_is_flat_regardless_of_whether_video_arrives(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    packets: list[bytes],
 ) -> None:
-    """No video means the glare-answered call is worth nothing yet, so the
-    hold must keep giving it a chance up to the hard cap - in 0.5s slices."""
+    """The hold used to keep extending in 0.5s slices up to a 4.5s cap while
+    hoping for video. Measured live on 2026-09-07: held from 3.0s to that cap
+    and still produced zero frames, because the ring-moment picture is the
+    gateway's own snapshot, not this video - so the hold is now a flat wait,
+    closing the call afterwards whether or not any packets ever arrived."""
     waits: list[float] = []
 
     async def _record_wait(timeout: float, *_events: asyncio.Event) -> None:
         waits.append(timeout)
 
     monkeypatch.setattr(capture, "_wait_for_first", _record_wait)
-    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_MAX_S", 4.5)
-    # No packets: the glare-answered call never produces any video.
-    coordinator = _FakeStationCoordinator(open_results=[False, True], auto_end=[False])
+    coordinator = _FakeStationCoordinator(
+        packets=packets, open_results=[False, True], auto_end=[False]
+    )
     writer = ring_clip.RingClipWriter(_Hass(), tmp_path, "clip")
 
     call_ended, opened, self_closed = asyncio.run(
@@ -1217,7 +1228,7 @@ def test_glare_hold_extends_to_the_cap_when_nothing_arrives(
     assert call_ended is False
     assert self_closed is True
     assert coordinator.close_calls == [True]
-    assert waits == [3.0, 0.5, 0.5, 0.5]
+    assert waits == [3.0]
 
 
 def test_glare_hold_stops_at_the_base_hold_once_video_arrives(
@@ -1232,7 +1243,6 @@ def test_glare_hold_stops_at_the_base_hold_once_video_arrives(
         waits.append(timeout)
 
     monkeypatch.setattr(capture, "_wait_for_first", _record_wait)
-    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_MAX_S", 4.5)
     coordinator = _FakeStationCoordinator(
         packets=[_rtp(1, b"\x65\x88IDR")], open_results=[False, True], auto_end=[False]
     )
@@ -1315,7 +1325,6 @@ def test_glare_self_close_runs_continuation_without_the_option(
     _patch_ffmpeg_success(monkeypatch)
     _no_redial_delay(monkeypatch)
     monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_S", 0.01)
-    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_MAX_S", 0.02)
     # open#1: our own dial, refused (glare). open#2: the fallback answer,
     # which the station never hangs up itself - only our own hold/close
     # logic ends it. open#3: the continuation's own dial, ended normally.
@@ -1340,3 +1349,68 @@ def test_glare_self_close_runs_continuation_without_the_option(
     _event_type, payload = hass.bus.fired[0]
     assert payload["ok"] is True
     assert payload["segments"] == 2
+
+
+def test_self_close_continuation_uses_the_shorter_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a hangup WE sent, the station has nothing of its own left to
+    tear down, so the first redial tries the shorter settle rather than the
+    delay measured after the STATION's own BYE."""
+    _patch_ffmpeg_success(monkeypatch)
+    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_S", 0)
+    delays: list[float] = []
+
+    async def _record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+    # open#1: our own dial, refused (glare). open#2: the fallback answer,
+    # which the station never hangs up itself, so our own hold/close logic
+    # ends it (self_closed=True). open#3: the continuation's own dial, ended
+    # normally so the loop stops after one retry.
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")],
+        open_results=[False, True, True],
+        auto_end=[False, True],
+    )
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={
+            capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips"),
+            "ring_clip_dial_instead_of_answer": True,
+        }
+    )
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1"))
+
+    assert delays[0] == capture._RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S
+
+
+def test_station_ended_continuation_still_uses_the_bye_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A continuation triggered by the STATION's own BYE (not a self-close)
+    must still wait the longer, BYE-measured settle before redialling."""
+    _patch_ffmpeg_success(monkeypatch)
+    delays: list[float] = []
+
+    async def _record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+    # open#1: the ring segment, answered normally and ended by the station
+    # itself (self_closed=False). open#2: first continuation attempt fails.
+    # open#3: second continuation attempt succeeds.
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")], open_results=[True, False, True]
+    )
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+
+    asyncio.run(
+        capture._capture_ring_clip(hass, _continuation_entry(tmp_path), "station1")
+    )
+
+    assert delays[0] == capture._RING_CLIP_REDIAL_DELAY_S
