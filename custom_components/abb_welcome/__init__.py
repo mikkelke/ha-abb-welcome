@@ -81,7 +81,7 @@ from .streaming_state import (
     is_pickup_allowed,
     set_pickup_allowed,
 )
-from .talkback_audio import async_prepare_talkback_audio
+from .talkback_audio import async_prepare_talkback_audio_cached
 from .text import decode_gateway_text, repair_utf8_mojibake
 
 _LOGGER = get_redacting_logger(__name__)
@@ -246,11 +246,13 @@ _RING_CLIP_REDIAL_ATTEMPTS = 3
 
 # Flat wait after answering the station's own (silent, glare-answered) ring
 # call, before we hang it up ourselves so the redial can bring up a call we
-# actually dialled — just long enough for the station's ACK to land after
-# our 200 OK. Measured live on 2026-09-07: holding from 3.0s to a 4.5s cap
-# still produced zero frames, and the ring-moment picture is the gateway's
-# own snapshot rather than this video, so holding any longer buys nothing.
-_RING_CLIP_GLARE_HOLD_S = 0.5
+# actually dialled. The accept path already waits for the station's ACK —
+# the accept log shows ack=True by the time we start using the call — so
+# this hold no longer has to buy that time; it only needs to outlast
+# whatever media setup is still in flight. 0.2s is the smallest value we
+# are willing to try here, not a measured number: a 486 on the redial still
+# falls back to the existing _RING_CLIP_REDIAL_ATTEMPTS retry loop below.
+_RING_CLIP_GLARE_HOLD_S = 0.2
 
 
 def _fire_discovery_changed(
@@ -1673,6 +1675,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 raise HomeAssistantError(
                     "Selected camera does not support talkback audio"
                 )
+            # Resolve (and cache) the PCM before the readiness gates: a cold
+            # piper synthesis measured ~1.4s on 2026-09-08, so a rejected
+            # poll here still warms the cache for the redialled call that is
+            # still being set up, instead of paying that cost only once a
+            # call already exists.
+            pcm = await async_prepare_talkback_audio_cached(
+                hass, media["media_content_id"]
+            )
             if not bool(getattr(camera, "talkback_ready", False)):
                 raise HomeAssistantError(
                     "Talkback is not ready; open the selected camera stream first"
@@ -1682,9 +1692,6 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     "The outdoor station does not render audio on a call it "
                     "originated; wait for a Home Assistant-dialled call"
                 )
-            pcm = await async_prepare_talkback_audio(
-                hass, media["media_content_id"]
-            )
             try:
                 await play(pcm, talkback_session_id)
             except HomeAssistantError:
@@ -1731,7 +1738,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     language=call.data.get("language") or None,
                     cache=True,
                 )
-                pcm = await async_prepare_talkback_audio(hass, media_content_id)
+                pcm = await async_prepare_talkback_audio_cached(
+                    hass, media_content_id
+                )
             except HomeAssistantError:
                 raise
             except (OSError, RuntimeError, TypeError, ValueError) as err:

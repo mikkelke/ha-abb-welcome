@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import stat
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
@@ -15,6 +16,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import get_url
+
+from .const import DOMAIN
 
 MAX_SOURCE_BYTES = 20 * 1024 * 1024
 MAX_DECODED_BYTES = 30 * 8000 * 2
@@ -252,3 +255,60 @@ async def async_prepare_talkback_audio(
     return await async_decode_audio(
         hass, await async_resolve_audio_source(hass, media_content_id)
     )
+
+
+# Deliberately its own top-level hass.data key rather than nested under
+# hass.data[DOMAIN]: several services registered there (arm_streaming when
+# called with no entry_id, chief among them) enumerate every key of
+# hass.data[DOMAIN] as if it were a config entry id, and would treat this
+# cache as a phantom entry and write their own state into it.
+_PCM_CACHE_DATA_KEY = f"{DOMAIN}_talkback_pcm_cache"
+_PCM_CACHE_MAX_ENTRIES = 16
+
+
+async def async_prepare_talkback_audio_cached(
+    hass: HomeAssistant, media_content_id: str
+) -> bytes:
+    """Resolve and decode one media selection, memoised per media id.
+
+    The AppDaemon ring-clip bridge polls for talkback readiness every 0.5s,
+    so 2-3 attempts can overlap while a cold TTS synthesis is still running
+    (~1.4s on piper, measured 2026-09-08). Only the first caller for a given
+    media id runs the resolver; concurrent callers for the same id await its
+    result instead of each re-running ffmpeg/piper. The cache holds the last
+    16 distinct media ids; a resolver failure is not cached, so the next
+    call retries it.
+    """
+    cache: OrderedDict[str, asyncio.Future[bytes]] = hass.data.setdefault(
+        _PCM_CACHE_DATA_KEY, OrderedDict()
+    )
+    future = cache.get(media_content_id)
+    if future is not None:
+        return await future
+
+    future = asyncio.get_running_loop().create_future()
+    cache[media_content_id] = future
+    while len(cache) > _PCM_CACHE_MAX_ENTRIES:
+        cache.popitem(last=False)
+
+    try:
+        pcm = await async_prepare_talkback_audio(hass, media_content_id)
+    except asyncio.CancelledError:
+        cache.pop(media_content_id, None)
+        if not future.done():
+            future.cancel()
+        raise
+    except Exception as err:
+        cache.pop(media_content_id, None)
+        if not future.done():
+            future.set_exception(err)
+            # We re-raise err ourselves below; this read only tells asyncio
+            # the exception was handled, so a failure with no concurrent
+            # awaiter does not log a spurious "exception was never
+            # retrieved" warning when the future is garbage collected.
+            future.exception()
+        raise
+    # Every concurrent awaiter shares this same bytes object; it is
+    # read-only downstream, so no defensive copy is needed per caller.
+    future.set_result(pcm)
+    return pcm
