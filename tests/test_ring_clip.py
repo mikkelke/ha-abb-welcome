@@ -1471,6 +1471,14 @@ class _TalkbackCamera:
         self.play_calls.append((pcm, session_id))
 
 
+class _EventBus:
+    def __init__(self) -> None:
+        self.fired: list[tuple[str, dict]] = []
+
+    def async_fire(self, event_type: str, event_data: dict | None = None) -> None:
+        self.fired.append((event_type, dict(event_data or {})))
+
+
 class _ServiceHass:
     def __init__(self, camera: _TalkbackCamera) -> None:
         self.data = {
@@ -1481,6 +1489,7 @@ class _ServiceHass:
             },
         }
         self.services = _ServiceRegistry()
+        self.bus = _EventBus()
 
 
 class _FakeServiceCall:
@@ -1515,3 +1524,62 @@ def test_play_audio_warms_the_pcm_cache_before_the_readiness_gate(
 
     assert resolved == ["media-source://tts/door-is-opening"]
     assert camera.play_calls == []
+
+
+def test_play_audio_announces_playout_length_before_the_first_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer that wants the door open AS the last word lands needs the
+    exact playout length up front, not the service's return (which only
+    comes after the sender's queue has drained). 8 kHz mono PCM16LE is 16
+    bytes per millisecond, so 18,880 bytes is 1,180 ms - the measured
+    length of "Door is opening."."""
+    pcm = bytes(18_880)
+
+    async def _fake_cached(_hass: object, _media_content_id: str) -> bytes:
+        return pcm
+
+    monkeypatch.setattr(capture, "async_prepare_talkback_audio_cached", _fake_cached)
+
+    camera = _TalkbackCamera(talkback_ready=True, talkback_audible=True)
+    camera.entity_id = "camera.front_door"
+    hass = _ServiceHass(camera)
+    capture._async_register_services(hass)
+    play_audio = hass.services.handlers[capture.SERVICE_PLAY_AUDIO]
+    call = _FakeServiceCall(
+        {"media": {"media_content_id": "media-source://tts/door-is-opening"}}
+    )
+
+    asyncio.run(play_audio(call))
+
+    assert hass.bus.fired == [
+        (
+            capture.EVENT_TALKBACK_PLAYING,
+            {
+                "entity_id": "camera.front_door",
+                "duration_ms": 1180,
+                "media_content_id": "media-source://tts/door-is-opening",
+            },
+        )
+    ]
+    assert camera.play_calls == [(pcm, "")]
+
+
+def test_play_audio_fires_no_playing_event_when_the_gate_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_cached(_hass: object, _media_content_id: str) -> bytes:
+        return bytes(160)
+
+    monkeypatch.setattr(capture, "async_prepare_talkback_audio_cached", _fake_cached)
+
+    camera = _TalkbackCamera(talkback_ready=True, talkback_audible=False)
+    hass = _ServiceHass(camera)
+    capture._async_register_services(hass)
+    play_audio = hass.services.handlers[capture.SERVICE_PLAY_AUDIO]
+    call = _FakeServiceCall({"media": {"media_content_id": "media-source://tts/x"}})
+
+    with pytest.raises(_CaptureHomeAssistantError, match="does not render audio"):
+        asyncio.run(play_audio(call))
+
+    assert hass.bus.fired == []
