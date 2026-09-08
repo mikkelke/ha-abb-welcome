@@ -227,6 +227,14 @@ EVENT_LISTENER_STATE = f"{DOMAIN}_listener_state"
 # Bus event fired once per native ring-clip capture attempt (automatic ring
 # capture or the record_clip service), after the mp4 remux finishes.
 EVENT_RING_CLIP = f"{DOMAIN}_ring_clip"
+# Fired the instant play_audio hands a clip to the talkback sender, with the
+# exact playout length. The door sentence is 8 kHz mono PCM16LE, so the
+# length is known to the frame before the first packet leaves; a consumer
+# that wants the door open AS the last word lands can subtract its own
+# actuation latency instead of waiting for the service to return (which is
+# only after the queue has drained) and then paying that latency on top.
+EVENT_TALKBACK_PLAYING = f"{DOMAIN}_talkback_playing"
+_TALKBACK_PCM_BYTES_PER_MS = 16  # 8000 Hz * 2 bytes / 1000
 
 # Mandatory settle time before re-dialing for a continuation segment.
 # Measured live: immediate re-dials return zero video and get BYE'd.
@@ -1692,6 +1700,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     "The outdoor station does not render audio on a call it "
                     "originated; wait for a Home Assistant-dialled call"
                 )
+            hass.bus.async_fire(
+                EVENT_TALKBACK_PLAYING,
+                {
+                    "entity_id": getattr(camera, "entity_id", ""),
+                    "duration_ms": len(pcm) // _TALKBACK_PCM_BYTES_PER_MS,
+                    "media_content_id": media["media_content_id"],
+                },
+            )
             try:
                 await play(pcm, talkback_session_id)
             except HomeAssistantError:
