@@ -663,7 +663,19 @@ def _install_capture_homeassistant_stubs() -> None:
 
     module("homeassistant.exceptions", HomeAssistantError=_HomeAssistantError)
     module("homeassistant.helpers.event", async_track_time_interval=lambda *_a, **_k: None)
-    module("homeassistant.helpers.selector", MediaSelector=object)
+
+    class _MediaSelector:
+        """Stands in for the real Selector: voluptuous needs a schema value
+        it can call as a validator, not just construct."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+        def __call__(self, value: object) -> object:
+            return value
+
+    module("homeassistant.helpers.selector", MediaSelector=_MediaSelector)
     module(
         "homeassistant.helpers.service",
         async_register_admin_service=lambda *_a, **_k: None,
@@ -674,7 +686,10 @@ def _install_capture_homeassistant_stubs() -> None:
         "homeassistant.helpers.dispatcher",
         async_dispatcher_send=lambda *_a, **_k: None,
     )
-    module("voluptuous")
+    # Real voluptuous (a test dependency, see the pytest invocation), not a
+    # stub: _async_register_services below builds real vol.Schema objects
+    # once a test actually calls it to exercise a registered service.
+    import voluptuous  # noqa: F401
 
 
 def _load_capture_module() -> types.ModuleType:
@@ -719,7 +734,11 @@ def _load_capture_module() -> types.ModuleType:
         is_pickup_allowed=lambda *_a, **_k: True,
         set_pickup_allowed=lambda *_a, **_k: None,
     )
-    fake("talkback_audio", async_prepare_talkback_audio=lambda *_a, **_k: None)
+    fake(
+        "talkback_audio",
+        async_prepare_talkback_audio=lambda *_a, **_k: None,
+        async_prepare_talkback_audio_cached=lambda *_a, **_k: None,
+    )
     # _capture_ring_clip's only use of camera.py is this lazily-imported
     # key helper; the real one is heavier (go2rtc/WebRTC-dependent).
     fake("camera", _safe_key=lambda station_id: station_id)
@@ -1414,3 +1433,85 @@ def test_station_ended_continuation_still_uses_the_bye_settle(
     )
 
     assert delays[0] == capture._RING_CLIP_REDIAL_DELAY_S
+
+
+# --------------------------------------------------------------------------- #
+# _play_audio service handler (custom_components/abb_welcome/__init__.py)
+#
+# Reuses the "capture" module load above (the only harness in this suite
+# that imports the real __init__.py) with a minimal fake hass.services
+# registrar standing in for Home Assistant's real one, so
+# _async_register_services can run for real and hand back the actual
+# registered handler to call directly.
+# --------------------------------------------------------------------------- #
+
+
+class _ServiceRegistry:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+
+    def has_service(self, _domain: str, service: str) -> bool:
+        return service in self.handlers
+
+    def async_register(
+        self, _domain: str, service: str, handler: object, schema: object = None
+    ) -> None:
+        self.handlers[service] = handler
+
+
+class _TalkbackCamera:
+    def __init__(
+        self, *, talkback_ready: bool, talkback_audible: bool = True
+    ) -> None:
+        self.talkback_ready = talkback_ready
+        self.talkback_audible = talkback_audible
+        self.play_calls: list[tuple[bytes, str]] = []
+
+    async def async_talkback_play_audio(self, pcm: bytes, session_id: str) -> None:
+        self.play_calls.append((pcm, session_id))
+
+
+class _ServiceHass:
+    def __init__(self, camera: _TalkbackCamera) -> None:
+        self.data = {
+            capture.DOMAIN: {
+                "entry1": {
+                    "camera_entities_by_entity_id": {"camera.front_door": camera},
+                },
+            },
+        }
+        self.services = _ServiceRegistry()
+
+
+class _FakeServiceCall:
+    def __init__(self, data: dict) -> None:
+        self.data = data
+
+
+def test_play_audio_warms_the_pcm_cache_before_the_readiness_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache resolve must run even on a poll the readiness gate goes on
+    to reject, so a cold TTS synthesis is already warm by the time the
+    redialled call exists and a later poll can actually play it."""
+    resolved: list[str] = []
+
+    async def _fake_cached(_hass: object, media_content_id: str) -> bytes:
+        resolved.append(media_content_id)
+        return b"door-is-opening"
+
+    monkeypatch.setattr(capture, "async_prepare_talkback_audio_cached", _fake_cached)
+
+    camera = _TalkbackCamera(talkback_ready=False)
+    hass = _ServiceHass(camera)
+    capture._async_register_services(hass)
+    play_audio = hass.services.handlers[capture.SERVICE_PLAY_AUDIO]
+    call = _FakeServiceCall(
+        {"media": {"media_content_id": "media-source://tts/door-is-opening"}}
+    )
+
+    with pytest.raises(_CaptureHomeAssistantError, match="Talkback is not ready"):
+        asyncio.run(play_audio(call))
+
+    assert resolved == ["media-source://tts/door-is-opening"]
+    assert camera.play_calls == []
