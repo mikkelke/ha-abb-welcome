@@ -232,6 +232,15 @@ EVENT_RING_CLIP = f"{DOMAIN}_ring_clip"
 # only after the queue has drained) and then paying that latency on top.
 EVENT_TALKBACK_PLAYING = f"{DOMAIN}_talkback_playing"
 _TALKBACK_PCM_BYTES_PER_MS = 16  # 8000 Hz * 2 bytes / 1000
+# Silence prepended to every clip played into a live call. The station clips
+# the first word of a sentence that starts the instant talkback is audible
+# (heard at the door 2026-09-11, "Door is opening." arrived as "...is
+# opening."); the sender is already pacing silence packets by then, so this
+# is the station's own speaker path settling after the talkspurt begins, not
+# a gap on the wire. Counted in duration_ms so the door still opens on the
+# last word.
+_TALKBACK_LEAD_SILENCE_MS = 400
+_TALKBACK_LEAD_SILENCE = bytes(_TALKBACK_LEAD_SILENCE_MS * _TALKBACK_PCM_BYTES_PER_MS)
 
 # Mandatory settle time before re-dialing for a continuation segment.
 # Measured live: immediate re-dials return zero video and get BYE'd.
@@ -1710,7 +1719,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
             # poll here still warms the cache for the redialled call that is
             # still being set up, instead of paying that cost only once a
             # call already exists.
-            pcm = await async_prepare_talkback_audio_cached(
+            pcm = _TALKBACK_LEAD_SILENCE + await async_prepare_talkback_audio_cached(
                 hass, media["media_content_id"]
             )
             if not bool(getattr(camera, "talkback_ready", False)):
@@ -1776,8 +1785,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     language=call.data.get("language") or None,
                     cache=True,
                 )
-                pcm = await async_prepare_talkback_audio_cached(
-                    hass, media_content_id
+                pcm = (
+                    _TALKBACK_LEAD_SILENCE
+                    + await async_prepare_talkback_audio_cached(
+                        hass, media_content_id
+                    )
                 )
             except HomeAssistantError:
                 raise

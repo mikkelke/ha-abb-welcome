@@ -1533,7 +1533,8 @@ def test_play_audio_announces_playout_length_before_the_first_packet(
     exact playout length up front, not the service's return (which only
     comes after the sender's queue has drained). 8 kHz mono PCM16LE is 16
     bytes per millisecond, so 18,880 bytes is 1,180 ms - the measured
-    length of "Door is opening."."""
+    length of "Door is opening." - plus the 400 ms lead-in silence the
+    station needs before it renders the first word."""
     pcm = bytes(18_880)
 
     async def _fake_cached(_hass: object, _media_content_id: str) -> bytes:
@@ -1557,12 +1558,13 @@ def test_play_audio_announces_playout_length_before_the_first_packet(
             capture.EVENT_TALKBACK_PLAYING,
             {
                 "entity_id": "camera.front_door",
-                "duration_ms": 1180,
+                "duration_ms": 1580,
                 "media_content_id": "media-source://tts/door-is-opening",
             },
         )
     ]
-    assert camera.play_calls == [(pcm, "")]
+    assert camera.play_calls == [(capture._TALKBACK_LEAD_SILENCE + pcm, "")]
+    assert len(capture._TALKBACK_LEAD_SILENCE) == 6_400
 
 
 def test_play_audio_fires_no_playing_event_when_the_gate_rejects(
