@@ -173,9 +173,22 @@ class _FakeStreamSession:
         self.calls.append(("open", prefer_dial))
         self.active = True
 
-    async def send_talkback_pcm16le_audio(self, pcm: bytes) -> dict[str, int]:
+    async def send_talkback_pcm16le_audio(
+        self, pcm: bytes, *, on_started: object = None
+    ) -> dict[str, int]:
         self.calls.append(("play", pcm))
+        if on_started is not None:
+            on_started()
         return {"packets": 3}
+
+    async def send_talkback_tone(
+        self, *, duration_ms: int, frequency_hz: int, amplitude: float
+    ) -> dict[str, int]:
+        self.calls.append(("tone", duration_ms, frequency_hz, amplitude))
+        return {"packets": 1}
+
+    def talkback_stats(self) -> dict[str, object]:
+        return {}
 
     async def close(self) -> None:
         self.calls.append("close")
@@ -191,6 +204,9 @@ def _coordinator(
         camera.StationStreamCoordinator
     )
     coordinator.session = session or _FakeStreamSession()
+    coordinator.door = types.SimpleNamespace(
+        station_id="test-station", address="192.0.2.1"
+    )
     coordinator._stream_lock = asyncio.Lock()
     coordinator._rtsp_play_sessions = []
     coordinator._close_task = None
@@ -384,25 +400,91 @@ def test_rtsp_attach_is_rejected_and_closed_during_peer_announcement() -> None:
     asyncio.run(scenario())
 
 
-def test_send_talkback_pcm16le_audio_refuses_a_station_originated_call() -> None:
-    """The outdoor station only ever renders talkback on a call it did not
-    originate itself - a call it answered into is silent in both directions."""
+def test_send_talkback_pcm16le_audio_warns_but_proceeds_on_a_station_originated_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A picked-up doorbell call IS a station-originated call, and
+    talk_pcm16le is the microphone path the Scrypted plugin uses for
+    two-way audio on exactly that call - it must keep working, just with a
+    logged warning that the outdoor station itself renders no audio for it."""
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        camera,
+        "_LOGGER",
+        types.SimpleNamespace(warning=lambda *args: warnings.append(args)),
+    )
 
     async def scenario() -> None:
         session = _FakeStreamSession()
         session.call_is_station_originated = True
         coordinator = _coordinator(session)
 
-        with pytest.raises(RuntimeError, match="does not render audio"):
-            await coordinator.send_talkback_pcm16le_audio(b"speech")
+        result = await coordinator.send_talkback_pcm16le_audio(b"speech")
 
-        assert session.calls == []
+        assert result == {"packets": 3, "owner": ""}
+        assert session.calls == [("play", b"speech")]
+        assert len(warnings) == 1
 
         session.call_is_station_originated = False
         result = await coordinator.send_talkback_pcm16le_audio(b"speech")
 
         assert result == {"packets": 3, "owner": ""}
-        assert session.calls == [("play", b"speech")]
+        assert session.calls == [("play", b"speech"), ("play", b"speech")]
+        assert len(warnings) == 1
+
+    asyncio.run(scenario())
+
+
+def test_send_talkback_tone_warns_but_proceeds_on_a_station_originated_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same contract as send_talkback_pcm16le_audio: talk_tone is also a
+    station-originated-call-safe microphone/diagnostics service, not a door
+    announcement, so it must not refuse a picked-up call either."""
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        camera,
+        "_LOGGER",
+        types.SimpleNamespace(warning=lambda *args: warnings.append(args)),
+    )
+
+    async def scenario() -> None:
+        session = _FakeStreamSession()
+        session.call_is_station_originated = True
+        coordinator = _coordinator(session)
+
+        result = await coordinator.send_talkback_tone(
+            duration_ms=1200, frequency_hz=880, amplitude=0.35
+        )
+
+        assert result == {"packets": 1, "owner": ""}
+        assert session.calls == [("tone", 1200, 880, 0.35)]
+        assert len(warnings) == 1
+
+    asyncio.run(scenario())
+
+
+def test_send_talkback_pcm16le_audio_owner_mismatch_never_starts_playback() -> None:
+    """A caller that lost the talkback-owner race is ignored outright - it
+    must not get an on_started callback fired for audio that never plays."""
+
+    async def scenario() -> None:
+        session = _FakeStreamSession()
+        coordinator = _coordinator(session)
+        coordinator._talkback_owner = "first-caller"
+        started: list[bool] = []
+
+        def _mark_started() -> None:
+            started.append(True)
+
+        result = await coordinator.send_talkback_pcm16le_audio(
+            b"speech", session_id="second-caller", on_started=_mark_started
+        )
+
+        assert result["ignored"] is True
+        assert result["ignore_reason"] == "talkback_session_owner_mismatch"
+        assert session.calls == []
+        assert started == []
 
     asyncio.run(scenario())
 

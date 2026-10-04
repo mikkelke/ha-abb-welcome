@@ -1456,9 +1456,21 @@ class _TalkbackCamera:
         self.talkback_ready = talkback_ready
         self.talkback_audible = talkback_audible
         self.play_calls: list[tuple[bytes, str]] = []
+        self.on_started_calls = 0
 
-    async def async_talkback_play_audio(self, pcm: bytes, session_id: str) -> None:
+    async def async_talkback_play_audio(
+        self,
+        pcm: bytes,
+        session_id: str,
+        on_started: object = None,
+    ) -> None:
         self.play_calls.append((pcm, session_id))
+        # Stands in for the real sender: a real on_started only fires once
+        # the sender actually starts the talkspurt, which on this fake is
+        # "immediately, every successful call".
+        if on_started is not None:
+            self.on_started_calls += 1
+            on_started()
 
 
 class _EventBus:
