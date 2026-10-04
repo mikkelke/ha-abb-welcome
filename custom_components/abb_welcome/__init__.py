@@ -224,12 +224,16 @@ EVENT_LISTENER_STATE = f"{DOMAIN}_listener_state"
 # Bus event fired once per native ring-clip capture attempt (automatic ring
 # capture or the record_clip service), after the mp4 remux finishes.
 EVENT_RING_CLIP = f"{DOMAIN}_ring_clip"
-# Fired the instant play_audio hands a clip to the talkback sender, with the
-# exact playout length. The door sentence is 8 kHz mono PCM16LE, so the
-# length is known to the frame before the first packet leaves; a consumer
-# that wants the door open AS the last word lands can subtract its own
-# actuation latency instead of waiting for the service to return (which is
-# only after the queue has drained) and then paying that latency on top.
+# Fired by the sender itself the instant it starts the talkspurt (inside
+# StreamSession._play_talkback_frames, right after the playback-lock and
+# active-sender checks pass) - not merely when play_audio hands the clip
+# over, so a downstream refusal (owner mismatch, playback already in
+# progress) never fires it. The clip is already fully decoded 8 kHz mono
+# PCM16LE by then, so the exact playout length is still known before any of
+# it has been paced out; a consumer that wants the door open AS the last
+# word lands can subtract its own actuation latency instead of waiting for
+# the service to return (which is only after the queue has drained) and
+# then paying that latency on top.
 EVENT_TALKBACK_PLAYING = f"{DOMAIN}_talkback_playing"
 _TALKBACK_PCM_BYTES_PER_MS = 16  # 8000 Hz * 2 bytes / 1000
 # Silence prepended to every clip played into a live call. The station clips
@@ -1662,11 +1666,6 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     raise HomeAssistantError(
                         "Selected camera does not support talkback"
                     )
-                if not bool(getattr(camera, "talkback_audible", True)):
-                    raise HomeAssistantError(
-                        "The outdoor station does not render audio on a call "
-                        "it originated; wait for a Home Assistant-dialled call"
-                    )
                 stats = await tone(
                     duration_ms=call.data["duration_ms"],
                     frequency_hz=call.data["frequency_hz"],
@@ -1731,16 +1730,18 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     "The outdoor station does not render audio on a call it "
                     "originated; wait for a Home Assistant-dialled call"
                 )
-            hass.bus.async_fire(
-                EVENT_TALKBACK_PLAYING,
-                {
-                    "entity_id": getattr(camera, "entity_id", ""),
-                    "duration_ms": len(pcm) // _TALKBACK_PCM_BYTES_PER_MS,
-                    "media_content_id": media["media_content_id"],
-                },
-            )
+            def _fire_playing() -> None:
+                hass.bus.async_fire(
+                    EVENT_TALKBACK_PLAYING,
+                    {
+                        "entity_id": getattr(camera, "entity_id", ""),
+                        "duration_ms": len(pcm) // _TALKBACK_PCM_BYTES_PER_MS,
+                        "media_content_id": media["media_content_id"],
+                    },
+                )
+
             try:
-                await play(pcm, talkback_session_id)
+                await play(pcm, talkback_session_id, on_started=_fire_playing)
             except HomeAssistantError:
                 raise
             except (OSError, RuntimeError, ValueError) as err:

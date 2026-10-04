@@ -436,6 +436,111 @@ def test_pcm_playback_pads_frames_and_rejects_busy(monkeypatch) -> None:
     asyncio.run(_cancel_playback())
 
 
+def test_send_talkback_pcm16le_audio_on_started_callback() -> None:
+    """on_started must fire exactly once, after the sender actually starts
+    talking - never before, never on a caller the playback lock rejects -
+    and a callback that raises must not abort the playback it announces."""
+    intercom_name = "abb_welcome.intercom_dialer"
+    pkg = sys.modules.setdefault("abb_welcome", types.ModuleType("abb_welcome"))
+    pkg.__path__ = [str(_PKG_DIR)]
+    for name in (intercom_name, "abb_welcome.media_pipeline"):
+        sys.modules.pop(name, None)
+    intercom_spec = importlib.util.spec_from_file_location(
+        intercom_name, _PKG_DIR / "intercom_dialer.py"
+    )
+    intercom = importlib.util.module_from_spec(intercom_spec)
+    sys.modules[intercom_name] = intercom
+    intercom_spec.loader.exec_module(intercom)
+    media_spec = importlib.util.spec_from_file_location(
+        "abb_welcome.media_pipeline", _PKG_DIR / "media_pipeline.py"
+    )
+    media = importlib.util.module_from_spec(media_spec)
+    sys.modules[media_spec.name] = media
+    media_spec.loader.exec_module(media)
+    session = media.StreamSession(
+        dialer=object(),
+        door=intercom.Door("door", "address"),
+        gateway_host="192.0.2.1",
+    )
+
+    class _Sender:
+        active = True
+        max_queue_frames = 10
+        interval = 0.02
+        talking = False
+
+        def __init__(self):
+            self.fed = []
+            self.events: list[str] = []
+
+        @property
+        def queue_frames(self):
+            return 0
+
+        def start_talk(self):
+            self.talking = True
+            self.events.append("start_talk")
+
+        def stop_talk(self):
+            self.talking = False
+
+        def feed_pcm16le(self, frame):
+            self.fed.append(frame)
+
+        async def drain(self, timeout):
+            pass
+
+        def stats(self):
+            return {"talking": self.talking}
+
+    # Success: on_started fires exactly once, and only after start_talk().
+    sender = _Sender()
+    session._talk_sender = sender
+    started: list[str] = []
+    stats = asyncio.run(
+        session.send_talkback_pcm16le_audio(
+            b"\x01\x02\x03", on_started=lambda: started.append("started")
+        )
+    )
+    assert stats["talking"] is False
+    assert started == ["started"]
+    assert sender.events == ["start_talk"]
+
+    # A raising callback must not abort playback: the frame still feeds and
+    # the call still returns normally.
+    sender_raises = _Sender()
+    session._talk_sender = sender_raises
+
+    def _raise() -> None:
+        raise ValueError("consumer bug")
+
+    stats = asyncio.run(
+        session.send_talkback_pcm16le_audio(b"\x01\x02\x03", on_started=_raise)
+    )
+    assert stats["talking"] is False
+    assert len(sender_raises.fed) == 1
+
+    # Already-in-progress never reaches start_talk(), so on_started must
+    # never fire for the caller the lock rejects.
+    sender_busy = _Sender()
+    session._talk_sender = sender_busy
+    rejected_started: list[str] = []
+
+    async def _busy() -> None:
+        await session._talkback_playback_lock.acquire()
+        try:
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await session.send_talkback_pcm16le_audio(
+                    b"\0\0",
+                    on_started=lambda: rejected_started.append("started"),
+                )
+        finally:
+            session._talkback_playback_lock.release()
+
+    asyncio.run(_busy())
+    assert rejected_started == []
+
+
 def test_talkback_audible_reflects_who_originated_the_call() -> None:
     """The station only renders talkback on a call Home Assistant dialled -
     never on its own call, e.g. one we answered after losing a dial glare."""

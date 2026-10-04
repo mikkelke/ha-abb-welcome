@@ -863,9 +863,11 @@ class StationStreamCoordinator:
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
         if self.session.call_is_station_originated:
-            raise RuntimeError(
-                "the outdoor station does not render audio on a call it "
-                "originated; wait for a Home Assistant-dialled call"
+            _LOGGER.warning(
+                "[abb] talkback: station=%s call was station-originated; the "
+                "outdoor station will not render this audio until a Home "
+                "Assistant-dialled call replaces it",
+                self.door.station_id or self.door.address,
             )
         stats = await self.session.send_talkback_tone(
             duration_ms=duration_ms,
@@ -881,6 +883,7 @@ class StationStreamCoordinator:
         pcm: bytes,
         *,
         session_id: str = "",
+        on_started: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Play a complete decoded clip using talkback owner semantics."""
         if self._temporary_talkback_active:
@@ -894,11 +897,15 @@ class StationStreamCoordinator:
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
         if self.session.call_is_station_originated:
-            raise RuntimeError(
-                "the outdoor station does not render audio on a call it "
-                "originated; wait for a Home Assistant-dialled call"
+            _LOGGER.warning(
+                "[abb] talkback: station=%s call was station-originated; the "
+                "outdoor station will not render this audio until a Home "
+                "Assistant-dialled call replaces it",
+                self.door.station_id or self.door.address,
             )
-        stats = await self.session.send_talkback_pcm16le_audio(pcm)
+        stats = await self.session.send_talkback_pcm16le_audio(
+            pcm, on_started=on_started
+        )
         stats["owner"] = self._talkback_owner
         self._notify_state()
         return stats
@@ -1506,11 +1513,13 @@ class ABBWelcomeCamera(Camera):
         self,
         pcm: bytes,
         talkback_session_id: str = "",
+        on_started: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Play decoded PCM audio through this camera's talkback leg."""
         stats = await self._coordinator.send_talkback_pcm16le_audio(
             pcm,
             session_id=talkback_session_id,
+            on_started=on_started,
         )
         self.async_write_ha_state()
         return stats

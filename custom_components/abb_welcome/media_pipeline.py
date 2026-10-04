@@ -1764,7 +1764,12 @@ class StreamSession:
             tone_frames, drain_timeout=max(1.0, duration_ms / 1000 + 1.0)
         )
 
-    async def send_talkback_pcm16le_audio(self, pcm: bytes) -> dict[str, Any]:
+    async def send_talkback_pcm16le_audio(
+        self,
+        pcm: bytes,
+        *,
+        on_started: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         """Play a complete PCM16LE clip through the active talkback sender."""
         if not pcm:
             raise RuntimeError("talkback audio is empty")
@@ -1778,11 +1783,17 @@ class StreamSession:
             for offset in range(0, len(pcm), frame_bytes)
         ]
         return await self._play_talkback_frames(
-            frames, drain_timeout=max(1.0, len(frames) * 0.02 + 1.0)
+            frames,
+            drain_timeout=max(1.0, len(frames) * 0.02 + 1.0),
+            on_started=on_started,
         )
 
     async def _play_talkback_frames(
-        self, frames: list[bytes], *, drain_timeout: float
+        self,
+        frames: list[bytes],
+        *,
+        drain_timeout: float,
+        on_started: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Play pre-built 20 ms PCM frames with bounded queue pacing."""
         if self._talkback_playback_lock.locked():
@@ -1794,6 +1805,11 @@ class StreamSession:
                     "talkback is not ready; open the camera stream first"
                 )
             sender.start_talk()
+            if on_started is not None:
+                try:
+                    on_started()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("talkback on_started callback raised: %s", err)
             try:
                 high_watermark = max(1, min(sender.max_queue_frames, 10))
                 low_watermark = max(1, high_watermark // 2)
