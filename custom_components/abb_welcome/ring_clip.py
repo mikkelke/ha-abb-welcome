@@ -531,8 +531,8 @@ class RingClipWriter:
         """Cut the clip's first frame to ``<stem>.jpg`` beside the mp4.
 
         Best effort: any failure is logged and returns None, so the clip
-        itself is never affected; a file left by a failed ffmpeg run is
-        removed. Cancellation still propagates, as it does for the remux.
+        itself is never affected. Cancellation still propagates, as it does
+        for the remux.
         """
         poster_path = video_path.with_suffix(".jpg")
         argv = [
@@ -557,7 +557,6 @@ class RingClipWriter:
                 error = "wrote no frame"
             if not error:
                 return poster_path
-            await self.hass.async_add_executor_job(_unlink_if_exists, poster_path)
         except Exception:  # a poster must never fail its clip
             _LOGGER.exception(
                 "[abb] ring clip: %s poster failed unexpectedly, keeping the clip "
