@@ -67,7 +67,9 @@ MIN_RING_CLIP_SECONDS = 2
 MAX_RING_CLIP_SECONDS = 60
 
 CONF_RING_CLIP_DIR = "ring_clip_dir"
-DEFAULT_RING_CLIP_DIR = "www/abb_doorbell"
+# HA's local media folder on HA OS and container installs: served to signed-in
+# users only. A directory under www/ is served to anyone who can reach HA.
+DEFAULT_RING_CLIP_DIR = "/media/abb_doorbell"
 
 CONF_RING_CLIP_CONTINUE_AFTER_HANGUP = "ring_clip_continue_after_hangup"
 DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP = False

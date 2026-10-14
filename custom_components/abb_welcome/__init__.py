@@ -469,14 +469,23 @@ async def _record_ring_segment(
     return call_ended.is_set(), opened, self_closed
 
 
-def _ring_clip_public_url(hass: HomeAssistant, target_dir: Path, filename: str) -> str:
-    """Return the /local/ URL for a file under HA's www directory, else ''."""
-    try:
-        relative = target_dir.resolve().relative_to(Path(hass.config.path("www")).resolve())
-    except (OSError, ValueError):
-        return ""
-    suffix = "/".join(relative.parts)
-    return f"/local/{suffix}/{filename}" if suffix else f"/local/{filename}"
+def _ring_clip_url(hass: HomeAssistant, target_dir: Path, filename: str) -> str:
+    """Return the path HA serves a clip file at, else ''.
+
+    /media/<source>/... for a media folder, which HA serves to signed-in users
+    only, or /local/... for www/, which it serves to anyone.
+    """
+    roots = [
+        (f"/media/{source}", path) for source, path in hass.config.media_dirs.items()
+    ]
+    roots.append(("/local", hass.config.path("www")))
+    for prefix, root in roots:
+        try:
+            relative = target_dir.resolve().relative_to(Path(root).resolve())
+        except (OSError, ValueError):
+            continue
+        return "/".join([prefix, *relative.parts, filename])
+    return ""
 
 
 def _ring_clip_event_payload(
@@ -497,10 +506,10 @@ def _ring_clip_event_payload(
         "station_id": station_id,
         "filename": filename,
         "path": str(result.output_path),
-        "url": _ring_clip_public_url(hass, target_dir, filename),
+        "url": _ring_clip_url(hass, target_dir, filename),
         "poster_filename": poster_filename,
         "poster_url": (
-            _ring_clip_public_url(hass, target_dir, poster_filename)
+            _ring_clip_url(hass, target_dir, poster_filename)
             if poster_filename
             else ""
         ),

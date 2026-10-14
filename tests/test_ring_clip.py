@@ -858,6 +858,7 @@ class _EventBus:
 class _CaptureConfig:
     def __init__(self, config_dir: Path) -> None:
         self._config_dir = config_dir
+        self.media_dirs = {"local": str(config_dir.parent / "media")}
 
     def path(self, *parts: str) -> str:
         return str(Path(self._config_dir, *parts))
@@ -1000,6 +1001,48 @@ def test_capture_ring_clip_payload_names_the_poster(
     assert payload["poster_filename"] == "clip.jpg"
     assert payload["poster_url"] == "/local/abb_doorbell/clip.jpg"
     assert (tmp_path / "config" / "www" / "abb_doorbell" / "clip.jpg").exists()
+
+
+def test_capture_ring_clip_in_a_media_folder_gets_media_urls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "media" / "abb_doorbell")}
+    )
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1", filename="clip"))
+
+    _event_type, payload = hass.bus.fired[0]
+    assert payload["url"] == "/media/local/abb_doorbell/clip.mp4"
+    assert payload["poster_url"] == "/media/local/abb_doorbell/clip.jpg"
+    assert (tmp_path / "media" / "abb_doorbell" / "clip.jpg").exists()
+
+
+def test_capture_ring_clip_outside_served_folders_gets_no_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips")}
+    )
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1", filename="clip"))
+
+    _event_type, payload = hass.bus.fired[0]
+    assert payload["ok"] is True
+    assert payload["url"] == ""
+    assert payload["poster_url"] == ""
+
+
+def test_default_ring_clip_dir_is_the_media_folder_not_www() -> None:
+    assert const.DEFAULT_RING_CLIP_DIR == "/media/abb_doorbell"
 
 
 def test_capture_ring_clip_poster_failure_still_reports_the_clip(

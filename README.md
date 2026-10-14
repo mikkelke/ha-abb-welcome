@@ -434,9 +434,14 @@ Options, under **ABB Welcome options**:
   ring-clip option below is inert while this is off.
 - **Ring clip duration (seconds)**: how long to record, from 2 to 60 seconds
   (default 10).
-- **Ring clip storage directory**: relative to the Home Assistant config
-  folder (default `www/abb_doorbell`). Anything under `www/` is also served
-  at `/local/...`, which is what the fired event's `url` field points to.
+- **Ring clip storage directory**: absolute, or relative to the Home
+  Assistant config folder (default `/media/abb_doorbell`, Home Assistant's
+  local media folder on HA OS and container installs). Home Assistant serves
+  a media folder only to signed-in users, at `/media/local/...`, which is
+  what the fired event's `url` and `poster_url` fields point to. Keep clips
+  out of `www/`: Home Assistant serves `www/` at `/local/...` to anyone who
+  can reach it, without a login, so an instance reachable from the internet
+  would publish every visitor at the door.
 - **Continue recording after the ring call ends**: if the visitor hangs up
   before the configured duration has elapsed, HA waits briefly and re-dials
   the same station to keep recording — as a second segment merged into the
@@ -462,10 +467,10 @@ Every automatic ring capture, and every `record_clip` service call, fires
 {
   "station_id": "100000001",
   "filename": "abb_ringclip_20260101_120000_100000001.mp4",
-  "path": "/config/www/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
-  "url": "/local/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
+  "path": "/media/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
+  "url": "/media/local/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
   "poster_filename": "abb_ringclip_20260101_120000_100000001.jpg",
-  "poster_url": "/local/abb_doorbell/abb_ringclip_20260101_120000_100000001.jpg",
+  "poster_url": "/media/local/abb_doorbell/abb_ringclip_20260101_120000_100000001.jpg",
   "duration_s": 9.8,
   "frames": 58,
   "segments": 1,
@@ -477,7 +482,9 @@ Every automatic ring capture, and every `record_clip` service call, fires
 
 The poster is the clip's first frame as a JPEG, written next to the mp4.
 `poster_filename` and `poster_url` are empty when it could not be cut; the
-clip itself is unaffected.
+clip itself is unaffected. `url` and `poster_url` are empty for a directory
+Home Assistant does not serve. A relative `/media/local/...` path works as a
+notification image: the companion apps fetch it with their own login.
 
 `abb_welcome.record_clip` captures a clip on demand — targeting a camera
 entity, an outdoor `station_id`, or an `entry_id` — through the same capture
