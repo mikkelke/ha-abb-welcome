@@ -186,6 +186,8 @@ class RingClipResult:
     segments: int
     fps: float
     error: str = ""
+    poster_path: Path | None = None
+    poster_filename: str = ""
 
 
 def _write_h264_file(path: Path, buffers: Sequence[bytes]) -> None:
@@ -207,6 +209,46 @@ def _unlink_if_exists(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    """Blocking existence-and-size check; runs inside an executor job."""
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+async def _run_ffmpeg(argv: Sequence[str], timeout: float) -> str:
+    """Run one ffmpeg command; return "" on success, else why it failed.
+
+    Cancellation kills the process and propagates.
+    """
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    except TimeoutError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        return "timed out"
+    except OSError as err:
+        return f"failed to start: {err}"
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        return f"exited {process.returncode}: {detail[:300]}"
+    return ""
 
 
 # ``record_clip`` accepts a caller-supplied ``filename``, so a clip name is
@@ -356,7 +398,9 @@ class RingClipWriter:
         concatenated ``.h264`` file, and — on success — removing it) runs
         via ``hass.async_add_executor_job`` so this coroutine never blocks
         the event loop. On ffmpeg failure the ``.h264`` file is kept and
-        ``ok`` is False; on success it is removed.
+        ``ok`` is False; on success it is removed, and the clip's first
+        frame is cut to ``<stem>.jpg`` beside the mp4. A poster failure
+        leaves ``ok`` True and ``poster_filename`` empty.
         """
         self.close()
         for segment in extra_segments:
@@ -426,8 +470,9 @@ class RingClipWriter:
         # Deferred so importing this module never requires homeassistant.
         from homeassistant.components.ffmpeg import get_ffmpeg_manager
 
+        binary = get_ffmpeg_manager(self.hass).binary
         argv = [
-            get_ffmpeg_manager(self.hass).binary,
+            binary,
             "-hide_banner",
             "-loglevel",
             "error",
@@ -459,32 +504,12 @@ class RingClipWriter:
                 error=error,
             )
 
-        process: asyncio.subprocess.Process | None = None
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.CancelledError:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
-            raise
-        except TimeoutError:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
-            return _failure("ffmpeg remux timed out")
-        except OSError as err:
-            return _failure(f"ffmpeg failed to start: {err}")
-
-        if process.returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace").strip()
-            return _failure(f"ffmpeg exited {process.returncode}: {detail[:300]}")
+        error = await _run_ffmpeg(argv, timeout)
+        if error:
+            return _failure(f"ffmpeg {error}")
 
         await self.hass.async_add_executor_job(_unlink_if_exists, self.path)
+        poster_path = await self._write_poster(binary, output_path, timeout)
 
         return RingClipResult(
             ok=True,
@@ -496,4 +521,53 @@ class RingClipWriter:
             started_at=started_at,
             segments=len(non_empty),
             fps=fps,
+            poster_path=poster_path,
+            poster_filename=poster_path.name if poster_path is not None else "",
         )
+
+    async def _write_poster(
+        self, binary: str, video_path: Path, timeout: float
+    ) -> Path | None:
+        """Cut the clip's first frame to ``<stem>.jpg`` beside the mp4.
+
+        Best effort: any failure is logged and returns None, so the clip
+        itself is never affected; a file left by a failed ffmpeg run is
+        removed. Cancellation still propagates, as it does for the remux.
+        """
+        poster_path = video_path.with_suffix(".jpg")
+        argv = [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            str(poster_path),
+        ]
+        try:
+            error = await _run_ffmpeg(argv, timeout)
+            if not error and not await self.hass.async_add_executor_job(
+                _is_nonempty_file, poster_path
+            ):
+                error = "wrote no frame"
+            if not error:
+                return poster_path
+            await self.hass.async_add_executor_job(_unlink_if_exists, poster_path)
+        except Exception:  # a poster must never fail its clip
+            _LOGGER.exception(
+                "[abb] ring clip: %s poster failed unexpectedly, keeping the clip "
+                "without one",
+                self.name,
+            )
+            return None
+        _LOGGER.warning(
+            "[abb] ring clip: %s poster failed, keeping the clip without one: %s",
+            self.name,
+            error,
+        )
+        return None

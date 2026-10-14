@@ -464,6 +464,8 @@ Every automatic ring capture, and every `record_clip` service call, fires
   "filename": "abb_ringclip_20260101_120000_100000001.mp4",
   "path": "/config/www/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
   "url": "/local/abb_doorbell/abb_ringclip_20260101_120000_100000001.mp4",
+  "poster_filename": "abb_ringclip_20260101_120000_100000001.jpg",
+  "poster_url": "/local/abb_doorbell/abb_ringclip_20260101_120000_100000001.jpg",
   "duration_s": 9.8,
   "frames": 58,
   "segments": 1,
@@ -472,6 +474,10 @@ Every automatic ring capture, and every `record_clip` service call, fires
   "ok": true
 }
 ```
+
+The poster is the clip's first frame as a JPEG, written next to the mp4.
+`poster_filename` and `poster_url` are empty when it could not be cut; the
+clip itself is unaffected.
 
 `abb_welcome.record_clip` captures a clip on demand — targeting a camera
 entity, an outdoor `station_id`, or an `entry_id` — through the same capture
