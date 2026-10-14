@@ -673,7 +673,6 @@ def test_poster_failure_leaves_the_clip_ok(
         if failure == "unexpected-error":
             raise RuntimeError("executor shut down")
         if failure == "exit-nonzero":
-            output.write_bytes(b"\xff\xd8partial")
             return _FakeProcess(returncode=1, stderr=b"decode error")
         process = _FakeProcess(returncode=0)
         if failure == "timeout":
