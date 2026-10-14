@@ -392,8 +392,8 @@ def test_finalize_computes_fps_writes_mp4_and_removes_h264(
     process = _FakeProcess(returncode=0)
 
     async def _spawn(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
+        captured.setdefault("args", args)
+        captured.setdefault("kwargs", kwargs)
         Path(args[-1]).write_bytes(b"fake-mp4-bytes")
         return process
 
@@ -486,8 +486,10 @@ def test_finalize_concatenates_multi_segment_and_removes_both_h264(
     process = _FakeProcess(returncode=0)
 
     async def _spawn(*args, **_kwargs):
-        captured["args"] = args
-        captured["input_at_spawn_time"] = Path(args[args.index("-i") + 1]).read_bytes()
+        captured.setdefault("args", args)
+        captured.setdefault(
+            "input_at_spawn_time", Path(args[args.index("-i") + 1]).read_bytes()
+        )
         Path(args[-1]).write_bytes(b"fake-mp4-bytes")
         return process
 
@@ -560,7 +562,7 @@ def test_finalize_clamps_fps_to_sane_range(
     process = _FakeProcess(returncode=0)
 
     async def _spawn(*args, **_kwargs):
-        captured["args"] = args
+        captured.setdefault("args", args)
         Path(args[-1]).write_bytes(b"fake-mp4-bytes")
         return process
 
@@ -605,6 +607,92 @@ def test_finalize_is_cancellable_and_kills_the_ffmpeg_process(
 
     asyncio.run(_run_and_cancel())
     assert process.killed
+
+
+def test_finalize_cuts_a_poster_jpg_next_to_the_mp4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hass = _Hass()
+    writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
+    writer.on_video(_rtp(1, b"\x67SPS"))
+    writer.on_video(_rtp(2, b"\x65\x88IDR"))
+
+    calls: list[tuple[str, ...]] = []
+
+    async def _spawn(*args, **_kwargs):
+        calls.append(args)
+        output = Path(args[-1])
+        output.write_bytes(
+            b"\xff\xd8poster" if output.suffix == ".jpg" else b"fake-mp4-bytes"
+        )
+        return _FakeProcess(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    result = asyncio.run(writer.finalize())
+
+    assert result.ok is True
+    assert result.output_path == tmp_path / "clip.mp4"
+    assert result.poster_path == tmp_path / "clip.jpg"
+    assert result.poster_filename == "clip.jpg"
+    assert result.poster_path.read_bytes() == b"\xff\xd8poster"
+    assert len(calls) == 2
+    assert calls[1] == (
+        "/configured/ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(tmp_path / "clip.mp4"),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "3",
+        str(tmp_path / "clip.jpg"),
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["exit-nonzero", "no-frame-written", "spawn-error", "timeout", "unexpected-error"],
+)
+def test_poster_failure_leaves_the_clip_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    hass = _Hass()
+    writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
+    writer.on_video(_rtp(1, b"\x65\x88IDR"))
+
+    async def _spawn(*args, **_kwargs):
+        output = Path(args[-1])
+        if output.suffix == ".mp4":
+            output.write_bytes(b"fake-mp4-bytes")
+            return _FakeProcess(returncode=0)
+        if failure == "spawn-error":
+            raise OSError("ffmpeg vanished")
+        if failure == "unexpected-error":
+            raise RuntimeError("executor shut down")
+        if failure == "exit-nonzero":
+            output.write_bytes(b"\xff\xd8partial")
+            return _FakeProcess(returncode=1, stderr=b"decode error")
+        process = _FakeProcess(returncode=0)
+        if failure == "timeout":
+
+            async def _hang():
+                await asyncio.Event().wait()
+
+            process.communicate = _hang  # type: ignore[method-assign]
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    result = asyncio.run(writer.finalize(timeout=0.05))
+
+    assert result.ok is True
+    assert result.output_path == tmp_path / "clip.mp4"
+    assert result.output_path.read_bytes() == b"fake-mp4-bytes"
+    assert result.poster_path is None
+    assert result.poster_filename == ""
+    assert not (tmp_path / "clip.jpg").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -906,6 +994,49 @@ def test_capture_ring_clip_happy_path_fires_event_and_clears_in_flight(
     assert entry_data["ring_clip_in_flight_stations"] == set()
 
 
+def test_capture_ring_clip_payload_names_the_poster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(options={capture.CONF_RING_CLIP_DIR: "www/abb_doorbell"})
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1", filename="clip"))
+
+    _event_type, payload = hass.bus.fired[0]
+    assert payload["ok"] is True
+    assert payload["url"] == "/local/abb_doorbell/clip.mp4"
+    assert payload["poster_filename"] == "clip.jpg"
+    assert payload["poster_url"] == "/local/abb_doorbell/clip.jpg"
+    assert (tmp_path / "config" / "www" / "abb_doorbell" / "clip.jpg").exists()
+
+
+def test_capture_ring_clip_poster_failure_still_reports_the_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _spawn(*args, **_kwargs):
+        if args[-1].endswith(".jpg"):
+            return _FakeProcess(returncode=1, stderr=b"no frame")
+        Path(args[-1]).write_bytes(b"fake-mp4-bytes")
+        return _FakeProcess(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65\x88IDR")])
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(options={capture.CONF_RING_CLIP_DIR: "www/abb_doorbell"})
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1", filename="clip"))
+
+    _event_type, payload = hass.bus.fired[0]
+    assert payload["ok"] is True
+    assert payload["url"] == "/local/abb_doorbell/clip.mp4"
+    assert payload["poster_filename"] == ""
+    assert payload["poster_url"] == ""
+
+
 def test_capture_ring_clip_fires_event_even_when_body_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1058,7 +1189,7 @@ def test_finalize_excludes_the_dead_gap_between_segments_from_fps(
     process = _FakeProcess(returncode=0)
 
     async def _spawn(*args, **_kwargs):
-        captured["args"] = args
+        captured.setdefault("args", args)
         Path(args[-1]).write_bytes(b"fake-mp4-bytes")
         return process
 

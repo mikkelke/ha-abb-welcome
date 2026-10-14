@@ -484,6 +484,7 @@ def _ring_clip_event_payload(
     target_dir: Path,
 ) -> dict[str, object]:
     filename = result.output_path.name
+    poster_filename = result.poster_filename
     started_at = (
         datetime.fromtimestamp(result.started_at, tz=timezone.utc).isoformat()
         if result.started_at is not None
@@ -494,6 +495,12 @@ def _ring_clip_event_payload(
         "filename": filename,
         "path": str(result.output_path),
         "url": _ring_clip_public_url(hass, target_dir, filename),
+        "poster_filename": poster_filename,
+        "poster_url": (
+            _ring_clip_public_url(hass, target_dir, poster_filename)
+            if poster_filename
+            else ""
+        ),
         "duration_s": round(result.duration_s, 3),
         "frames": result.frames,
         "segments": result.segments,
