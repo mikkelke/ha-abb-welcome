@@ -284,7 +284,8 @@ async def async_prepare_talkback_audio_cached(
     )
     future = cache.get(media_content_id)
     if future is not None:
-        return await future
+        # Cancelling a waiter must not cancel the future the others share.
+        return await asyncio.shield(future)
 
     future = asyncio.get_running_loop().create_future()
     cache[media_content_id] = future
@@ -310,5 +311,6 @@ async def async_prepare_talkback_audio_cached(
         raise
     # Every concurrent awaiter shares this same bytes object; it is
     # read-only downstream, so no defensive copy is needed per caller.
-    future.set_result(pcm)
+    if not future.done():
+        future.set_result(pcm)
     return pcm

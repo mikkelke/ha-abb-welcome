@@ -164,3 +164,41 @@ def test_cache_evicts_beyond_16_entries(monkeypatch: pytest.MonkeyPatch) -> None
     assert "tts://0" not in cache
     assert "tts://1" in cache
     assert "tts://16" in cache
+
+
+def test_a_cancelled_waiting_caller_does_not_poison_the_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    release = asyncio.Event()
+
+    async def _resolver(_hass, media_id):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return b"pcm-" + media_id.encode()
+
+    monkeypatch.setattr(audio, "async_prepare_talkback_audio", _resolver)
+
+    async def scenario() -> tuple[bytes, bytes]:
+        hass = _Hass()
+        producer = asyncio.create_task(
+            audio.async_prepare_talkback_audio_cached(hass, "tts://d")
+        )
+        await asyncio.sleep(0)
+        waiter = asyncio.create_task(
+            audio.async_prepare_talkback_audio_cached(hass, "tts://d")
+        )
+        await asyncio.sleep(0)
+        waiter.cancel()
+        await asyncio.wait({waiter})
+        assert waiter.cancelled()
+        release.set()
+        first = await producer
+        second = await audio.async_prepare_talkback_audio_cached(hass, "tts://d")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first == b"pcm-tts://d"
+    assert second == b"pcm-tts://d"
+    assert calls == 1
