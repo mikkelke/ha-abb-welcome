@@ -1734,10 +1734,11 @@ def test_play_audio_announces_playout_length_before_the_first_packet(
             {
                 "entity_id": "camera.front_door",
                 "duration_ms": 1580,
-                "media_content_id": "media-source://tts/door-is-opening",
             },
         )
     ]
+    # The recorder persists bus events; a TTS media id embeds the spoken text.
+    assert "media_content_id" not in hass.bus.fired[0][1]
     assert camera.play_calls == [(capture._TALKBACK_LEAD_SILENCE + pcm, "")]
     assert len(capture._TALKBACK_LEAD_SILENCE) == 6_400
 

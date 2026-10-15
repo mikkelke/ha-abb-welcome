@@ -1730,7 +1730,6 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     {
                         "entity_id": getattr(camera, "entity_id", ""),
                         "duration_ms": len(pcm) // _TALKBACK_PCM_BYTES_PER_MS,
-                        "media_content_id": media["media_content_id"],
                     },
                 )
 
