@@ -557,6 +557,10 @@ class StationStreamCoordinator:
         self._notify_state()
         return self.session.active
 
+    async def async_decline_pending_ring(self) -> bool:
+        """Refuse the station's pending ring INVITE; False when none is pending."""
+        return await self.session.decline_pending_call()
+
     def _cancel_close_task(self) -> None:
         if self._close_task is not None and not self._close_task.done():
             self._close_task.cancel()

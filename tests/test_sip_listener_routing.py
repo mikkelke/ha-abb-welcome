@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -25,6 +27,8 @@ def _load(name: str) -> types.ModuleType:
     return sys.modules[full]
 
 
+intercom = _load("intercom_dialer")
+media = _load("media_pipeline")
 sip_listener = _load("sip_listener")
 
 
@@ -37,6 +41,16 @@ class _Writer:
 
     async def drain(self) -> None:
         return None
+
+
+class _OpenWriter(_Writer):
+    def is_closing(self) -> bool:
+        return False
+
+
+class _ClosingWriter(_Writer):
+    def is_closing(self) -> bool:
+        return True
 
 
 def _request(method: str = "INVITE"):
@@ -145,3 +159,118 @@ def test_register_wait_dispatches_requests_and_matches_exact_response() -> None:
     assert sip_listener._header(result.headers, "Call-ID") == "register"
     assert sip_listener._header(result.headers, "CSeq") == "7 REGISTER"
     assert frames == []
+
+
+def _pending_invite(call_id: str, station: str):
+    frame = sip_listener._SipFrame(
+        start_line="INVITE sip:ha@example.invalid SIP/2.0",
+        headers=[
+            ("Via", "SIP/2.0/TLS proxy.invalid;branch=first"),
+            ("From", f"<sip:{station}@example.invalid>;tag=remote"),
+            ("To", "<sip:ha@example.invalid>"),
+            ("Call-ID", call_id),
+            ("CSeq", "1 INVITE"),
+        ],
+        body=b"",
+        raw=b"",
+    )
+    frame._received_at = time.time()
+    return frame
+
+
+def _listener_with_pending(*frames):
+    listener = sip_listener.SipListener(
+        "gateway.invalid", "ha", "secret", "example.invalid"
+    )
+    listener._writer = _OpenWriter()
+    for frame in frames:
+        listener._open_invites[sip_listener._header(frame.headers, "Call-ID")] = frame
+    return listener
+
+
+def test_decline_pending_call_sends_486_busy_here_and_forgets_the_invite() -> None:
+    listener = _listener_with_pending(_pending_invite("ring-1", "door"))
+
+    assert asyncio.run(listener.decline_pending_call("door")) is True
+
+    response = listener._writer.data.decode("utf-8")
+    assert response.startswith("SIP/2.0 486 Busy Here\r\n")
+    assert "\r\nCall-ID: ring-1\r\n" in response
+    assert "\r\nCSeq: 1 INVITE\r\n" in response
+    assert re.search(r"\r\nTo: <sip:ha@example\.invalid>;tag=[0-9a-f]{8}\r\n", response)
+    assert len(re.findall(r"^SIP/2\.0 ", response, re.MULTILINE)) == 1
+    assert listener._open_invites == {}
+    assert listener._accepted_dialogs == {}
+
+
+def test_decline_pending_call_leaves_other_stations_invites_alone() -> None:
+    listener = _listener_with_pending(
+        _pending_invite("ring-1", "door"), _pending_invite("ring-2", "gate")
+    )
+
+    assert asyncio.run(listener.decline_pending_call("gate")) is True
+
+    assert "\r\nCall-ID: ring-2\r\n" in listener._writer.data.decode("utf-8")
+    assert list(listener._open_invites) == ["ring-1"]
+
+
+def test_decline_pending_call_returns_false_when_nothing_is_pending() -> None:
+    listener = _listener_with_pending()
+
+    assert asyncio.run(listener.decline_pending_call("door")) is False
+
+    assert listener._writer.data == b""
+
+
+@pytest.mark.parametrize("writer", [None, _ClosingWriter()])
+def test_decline_pending_call_keeps_the_invite_when_the_writer_is_gone(writer) -> None:
+    listener = _listener_with_pending(_pending_invite("ring-1", "door"))
+    listener._writer = writer
+
+    assert asyncio.run(listener.decline_pending_call("door")) is False
+
+    assert list(listener._open_invites) == ["ring-1"]
+
+
+def _session(listener, station_id: str = "door"):
+    return media.StreamSession(
+        dialer=object(),
+        door=intercom.Door("front", "address", station_id=station_id),
+        gateway_host="192.0.2.10",
+        incoming_listener=listener,
+    )
+
+
+def test_stream_session_decline_reaches_the_listener_for_its_own_station() -> None:
+    listener = _listener_with_pending(
+        _pending_invite("ring-1", "gate"), _pending_invite("ring-2", "door")
+    )
+
+    assert asyncio.run(_session(listener).decline_pending_call()) is True
+
+    assert listener._writer.data.startswith(b"SIP/2.0 486 Busy Here\r\n")
+    assert list(listener._open_invites) == ["ring-1"]
+
+
+@pytest.mark.parametrize("listener", [None, object()])
+def test_stream_session_declines_nothing_without_a_declining_listener(listener) -> None:
+    assert asyncio.run(_session(listener).decline_pending_call()) is False
+
+
+def test_stream_session_declines_nothing_for_a_door_without_a_station_id() -> None:
+    listener = _listener_with_pending(_pending_invite("ring-1", "door"))
+
+    session = _session(listener, station_id="")
+
+    assert asyncio.run(session.decline_pending_call()) is False
+
+    assert listener._writer.data == b""
+    assert list(listener._open_invites) == ["ring-1"]
+
+
+def test_stream_session_reports_no_decline_when_the_listener_raises() -> None:
+    class _Broken:
+        async def decline_pending_call(self, _station_id: str) -> bool:
+            raise ConnectionResetError("connection lost")
+
+    assert asyncio.run(_session(_Broken()).decline_pending_call()) is False

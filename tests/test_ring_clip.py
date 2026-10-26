@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 import struct
 import sys
 import types
@@ -888,6 +889,7 @@ class _FakeStationCoordinator:
         open_error: Exception | None = None,
         open_results: list[bool] | None = None,
         auto_end: list[bool] | None = None,
+        decline_results: list[bool] | None = None,
     ) -> None:
         self._packets = packets or []
         self._open_error = open_error
@@ -902,12 +904,17 @@ class _FakeStationCoordinator:
         # nobody hangs up but us - e.g. a glare-answered call, which is
         # silent and only ends when we call async_close_media ourselves.
         self._auto_end_results = list(auto_end or [])
+        # One entry per async_decline_pending_ring call: True means a pending
+        # station INVITE was refused. Exhausted list -> False, which is what
+        # the real listener reports once nothing is pending any more.
+        self._decline_results = list(decline_results or [])
         self._sink = None
         self._call_ended_callbacks: list = []
         self.opened = False
         self.open_calls = 0
         self.prefer_dial_calls: list[bool] = []
         self.close_calls: list[bool] = []
+        self.decline_calls = 0
 
     def add_packet_sink(self, sink: object) -> None:
         self._sink = sink
@@ -945,6 +952,15 @@ class _FakeStationCoordinator:
     async def async_close_media(self) -> bool:
         self.close_calls.append(True)
         return True
+
+    async def async_decline_pending_ring(self) -> bool:
+        self.decline_calls += 1
+        return self._decline_results.pop(0) if self._decline_results else False
+
+
+@pytest.fixture(autouse=True)
+def _glare_decline_trial_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(capture._GLARE_DECLINE_TRIAL, "enabled", True)
 
 
 def _patch_ffmpeg_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1355,7 +1371,7 @@ def test_failed_media_open_does_not_burn_the_recording_budget(
         waited["called"] = True
 
     monkeypatch.setattr(capture, "_wait_for_first", _never)
-    call_ended, opened, self_closed = asyncio.run(
+    call_ended, opened, self_closed, declined = asyncio.run(
         capture._record_ring_segment(
             coordinator, writer, max_seconds=30, stop_events=(asyncio.Event(),)
         )
@@ -1364,6 +1380,7 @@ def test_failed_media_open_does_not_burn_the_recording_budget(
     assert opened is False
     assert call_ended is False
     assert self_closed is False
+    assert declined is False
     assert waited["called"] is False, "must not wait for packets that cannot come"
 
 
@@ -1395,7 +1412,7 @@ def test_glare_hold_is_flat_regardless_of_whether_video_arrives(
     )
     writer = ring_clip.RingClipWriter(_Hass(), tmp_path, "clip")
 
-    call_ended, opened, self_closed = asyncio.run(
+    call_ended, opened, self_closed, declined = asyncio.run(
         capture._record_ring_segment(
             coordinator,
             writer,
@@ -1409,6 +1426,7 @@ def test_glare_hold_is_flat_regardless_of_whether_video_arrives(
     assert opened is True
     assert call_ended is False
     assert self_closed is True
+    assert declined is False
     assert coordinator.close_calls == [True]
     assert waits == [3.0]
 
@@ -1430,7 +1448,7 @@ def test_glare_hold_stops_at_the_base_hold_once_video_arrives(
     )
     writer = ring_clip.RingClipWriter(_Hass(), tmp_path, "clip")
 
-    call_ended, opened, self_closed = asyncio.run(
+    call_ended, opened, self_closed, declined = asyncio.run(
         capture._record_ring_segment(
             coordinator,
             writer,
@@ -1444,6 +1462,7 @@ def test_glare_hold_stops_at_the_base_hold_once_video_arrives(
     assert opened is True
     assert call_ended is False
     assert self_closed is True
+    assert declined is False
     assert coordinator.close_calls == [True]
     assert waits == [3.0]
 
@@ -1596,6 +1615,249 @@ def test_station_ended_continuation_still_uses_the_bye_settle(
     )
 
     assert delays[0] == capture._RING_CLIP_REDIAL_DELAY_S
+
+
+# --------------------------------------------------------------------------- #
+# Glare: decline the station's own call instead of answering it
+# --------------------------------------------------------------------------- #
+
+
+def _run_glare_segment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    coordinator: _FakeStationCoordinator,
+) -> tuple[tuple[bool, bool, bool, bool], list[float]]:
+    """Run one first-segment capture and return its result and its hold waits."""
+    waits: list[float] = []
+
+    async def _record_wait(timeout: float, *_events: asyncio.Event) -> None:
+        waits.append(timeout)
+
+    monkeypatch.setattr(capture, "_wait_for_first", _record_wait)
+    writer = ring_clip.RingClipWriter(_Hass(), tmp_path, "clip")
+    result = asyncio.run(
+        capture._record_ring_segment(
+            coordinator,
+            writer,
+            max_seconds=30,
+            stop_events=(asyncio.Event(),),
+            prefer_dial=True,
+            glare_hold_s=3.0,
+        )
+    )
+    return result, waits
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    delays: list[float] = []
+
+    async def _record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+    return delays
+
+
+def _run_ring(tmp_path: Path, coordinator: _FakeStationCoordinator) -> _CaptureHass:
+    hass = _CaptureHass(
+        _entry_data(coordinator, "station1"), config_dir=tmp_path / "config"
+    )
+    entry = _FakeConfigEntry(
+        options={
+            capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips"),
+            "ring_clip_dial_instead_of_answer": True,
+        }
+    )
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1"))
+    return hass
+
+
+def test_glare_declines_the_station_call_instead_of_answering_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = _FakeStationCoordinator(open_results=[False], decline_results=[True])
+
+    result, waits = _run_glare_segment(tmp_path, monkeypatch, coordinator)
+
+    call_ended, opened, self_closed, declined = result
+    assert (call_ended, opened) == (False, False)
+    assert (self_closed, declined) == (True, True)
+    assert coordinator.decline_calls == 1
+    assert coordinator.prefer_dial_calls == [True], "the station's call was answered"
+    assert coordinator.close_calls == []
+    assert waits == [], "nothing is open to hold"
+
+
+def test_glare_with_nothing_to_decline_answers_holds_and_hangs_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = _FakeStationCoordinator(
+        open_results=[False, True], auto_end=[False], decline_results=[False]
+    )
+
+    result, waits = _run_glare_segment(tmp_path, monkeypatch, coordinator)
+
+    call_ended, opened, self_closed, declined = result
+    assert (call_ended, opened) == (False, True)
+    assert (self_closed, declined) == (True, False)
+    assert coordinator.decline_calls == 1
+    assert coordinator.prefer_dial_calls == [True, False]
+    assert coordinator.close_calls == [True]
+    assert waits == [3.0]
+
+
+def test_glare_with_the_trial_disabled_never_declines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(capture._GLARE_DECLINE_TRIAL, "enabled", False)
+    coordinator = _FakeStationCoordinator(
+        open_results=[False, True], auto_end=[False], decline_results=[True]
+    )
+
+    result, waits = _run_glare_segment(tmp_path, monkeypatch, coordinator)
+
+    call_ended, opened, self_closed, declined = result
+    assert (call_ended, opened) == (False, True)
+    assert (self_closed, declined) == (True, False)
+    assert coordinator.decline_calls == 0
+    assert coordinator.prefer_dial_calls == [True, False]
+    assert coordinator.close_calls == [True]
+    assert waits == [3.0]
+
+
+def test_an_accepted_dial_never_touches_the_station_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = _FakeStationCoordinator(decline_results=[True])
+
+    result, _waits = _run_glare_segment(tmp_path, monkeypatch, coordinator)
+
+    call_ended, opened, self_closed, declined = result
+    assert (call_ended, opened) == (True, True)
+    assert (self_closed, declined) == (False, False)
+    assert coordinator.decline_calls == 0
+    assert coordinator.prefer_dial_calls == [True]
+
+
+@pytest.mark.parametrize(
+    "packets",
+    [
+        pytest.param([_rtp(1, b"\x65\x88IDR")], id="video-arrived"),
+        pytest.param([], id="no-video"),
+    ],
+)
+def test_an_accepted_redial_after_a_decline_keeps_the_trial_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    packets: list[bytes],
+) -> None:
+    """The redial is judged by whether media opened, not by whether video came."""
+    _patch_ffmpeg_success(monkeypatch)
+    delays = _record_sleeps(monkeypatch)
+    caplog.set_level(logging.INFO)
+    coordinator = _FakeStationCoordinator(
+        packets=packets, open_results=[False], decline_results=[True]
+    )
+
+    _run_ring(tmp_path, coordinator)
+
+    assert delays[0] == capture._RING_CLIP_DECLINE_REDIAL_DELAY_S
+    assert capture._GLARE_DECLINE_TRIAL["enabled"] is True
+    assert coordinator.decline_calls == 1
+    assert coordinator.close_calls == []
+    assert "declining freed station=" in caplog.text
+    assert "declining did not free" not in caplog.text
+
+
+def test_a_refused_redial_after_a_decline_switches_the_next_ring_to_answering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _patch_ffmpeg_success(monkeypatch)
+    delays = _record_sleeps(monkeypatch)
+    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_S", 0)
+    caplog.set_level(logging.INFO)
+    # Dial refused and the station's call declined; the first redial is then
+    # refused as well (nothing left to decline, fallback open refused too) and
+    # the second redial is accepted.
+    first_ring = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")],
+        open_results=[False, False, False],
+        decline_results=[True],
+    )
+
+    _run_ring(tmp_path / "ring1", first_ring)
+
+    assert delays[0] == capture._RING_CLIP_DECLINE_REDIAL_DELAY_S
+    assert capture._GLARE_DECLINE_TRIAL["enabled"] is False
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "declining did not free station=" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "declining freed" not in caplog.text
+
+    # A station INVITE is pending for the next ring too, but must not be declined.
+    second_ring = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")],
+        open_results=[False, True],
+        auto_end=[False],
+        decline_results=[True],
+    )
+    delays.clear()
+
+    _run_ring(tmp_path / "ring2", second_ring)
+
+    assert second_ring.decline_calls == 0
+    assert second_ring.prefer_dial_calls == [True, False, True]
+    assert second_ring.close_calls == [True]
+    assert delays[0] == capture._RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S
+
+
+def test_only_the_first_redial_after_a_decline_is_judged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_ffmpeg_success(monkeypatch)
+    _record_sleeps(monkeypatch)
+    # The first redial opens (without video); the later ones are refused.
+    coordinator = _FakeStationCoordinator(
+        open_results=[False, True, False, False, False, False],
+        decline_results=[True],
+    )
+
+    _run_ring(tmp_path, coordinator)
+
+    assert coordinator.open_calls > 2, "the later redials must have been tried"
+    assert capture._GLARE_DECLINE_TRIAL["enabled"] is True
+
+
+def test_a_refused_redial_after_an_answered_glare_leaves_the_trial_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only a redial that follows a decline says anything about declining."""
+    _patch_ffmpeg_success(monkeypatch)
+    _record_sleeps(monkeypatch)
+    monkeypatch.setattr(capture, "_RING_CLIP_GLARE_HOLD_S", 0)
+    caplog.set_level(logging.INFO)
+    # Dial refused, nothing pending to decline, so the station's call is
+    # answered and hung up by us; the first redial is then refused too.
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65\x88IDR")],
+        open_results=[False, True, False, False],
+        auto_end=[False],
+    )
+
+    _run_ring(tmp_path, coordinator)
+
+    assert coordinator.close_calls == [True]
+    assert capture._GLARE_DECLINE_TRIAL["enabled"] is True
+    assert "declining" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #
