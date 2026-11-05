@@ -275,10 +275,6 @@ _RING_CLIP_REDIAL_ATTEMPTS = 3
 # falls back to the existing _RING_CLIP_REDIAL_ATTEMPTS retry loop below.
 _RING_CLIP_GLARE_HOLD_S = 0.2
 
-_RING_CLIP_DECLINE_REDIAL_DELAY_S = 0.4
-# Cleared for the life of the process once a redial after a decline is refused.
-_GLARE_DECLINE_TRIAL = {"enabled": True}
-
 
 def _fire_discovery_changed(
     hass: HomeAssistant,
@@ -413,24 +409,20 @@ async def _record_ring_segment(
     stop_events: tuple[asyncio.Event, ...],
     prefer_dial: bool = False,
     glare_hold_s: float | None = None,
-) -> tuple[bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool]:
     """Record one segment onto ``writer``.
 
-    Returns ``(call_ended, media_opened, self_closed, declined)``.
-    ``async_open_for_ring`` never raises - it logs and reports failure through
-    its return value - and ignoring that meant a failed open still sat out the
-    whole ``max_seconds`` waiting for packets that could not arrive. Measured
-    on a back-door ring: the open failed at 10:19:58.567 and the clip finished
-    at 10:20:08.569, ten seconds of nothing.
+    Returns ``(call_ended, media_opened, self_closed)``. ``async_open_for_ring``
+    never raises - it logs and reports failure through its return value - and
+    ignoring that meant a failed open still sat out the whole ``max_seconds``
+    waiting for packets that could not arrive. Measured on a back-door ring:
+    the open failed at 10:19:58.567 and the clip finished at 10:20:08.569,
+    ten seconds of nothing.
 
     ``glare_hold_s``, when set, bounds how long a glare-answered call (see
     below) is held open for video before we hang it up ourselves so the
     caller's redial can bring up a call that can actually carry an
     announcement.
-
-    ``declined`` means the station's pending call was refused instead of
-    answered: nothing is open, and ``self_closed`` is set so the caller
-    redials.
     """
     call_ended = asyncio.Event()
 
@@ -440,30 +432,20 @@ async def _record_ring_segment(
     coordinator.add_packet_sink(writer)
     coordinator.add_call_ended_callback(_on_call_ended)
     self_closed = False
-    declined = False
     try:
         opened = await coordinator.async_open_for_ring(prefer_dial=prefer_dial)
         glare_answered = False
         if not opened and prefer_dial:
-            if _GLARE_DECLINE_TRIAL["enabled"]:
-                declined = await coordinator.async_decline_pending_ring()
-            if declined:
-                _LOGGER.info(
-                    "[abb] ring clip: declined the station's own call so our "
-                    "dial can take the line"
-                )
-                self_closed = True
-            else:
-                # Glare: the station has an INVITE outstanding to us, so it may
-                # refuse ours. Answering it still gets the video even though that
-                # call will not carry an audible announcement - a silent clip beats
-                # no clip.
-                _LOGGER.info(
-                    "[abb] ring clip: outbound dial refused, answering the "
-                    "station's own call instead (announcement will be silent)"
-                )
-                opened = await coordinator.async_open_for_ring(prefer_dial=False)
-                glare_answered = opened
+            # Glare: the station has an INVITE outstanding to us, so it may
+            # refuse ours. Answering it still gets the video even though that
+            # call will not carry an audible announcement - a silent clip beats
+            # no clip.
+            _LOGGER.info(
+                "[abb] ring clip: outbound dial refused, answering the "
+                "station's own call instead (announcement will be silent)"
+            )
+            opened = await coordinator.async_open_for_ring(prefer_dial=False)
+            glare_answered = opened
         if opened:
             if glare_answered and glare_hold_s is not None:
                 elapsed = min(max_seconds, glare_hold_s)
@@ -484,7 +466,7 @@ async def _record_ring_segment(
     finally:
         coordinator.remove_call_ended_callback(_on_call_ended)
         coordinator.remove_packet_sink(writer)
-    return call_ended.is_set(), opened, self_closed, declined
+    return call_ended.is_set(), opened, self_closed
 
 
 def _ring_clip_url(hass: HomeAssistant, target_dir: Path, filename: str) -> str:
@@ -634,7 +616,7 @@ async def _capture_ring_clip(
                     DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
                 )
             )
-            call_ended, _opened, self_closed, declined = await _record_ring_segment(
+            call_ended, _opened, self_closed = await _record_ring_segment(
                 coordinator,
                 writer,
                 max_seconds=seconds,
@@ -657,12 +639,11 @@ async def _capture_ring_clip(
                 and writer.elapsed_s < seconds
             ):
                 remaining = seconds - writer.elapsed_s
-                if declined:
-                    delay = _RING_CLIP_DECLINE_REDIAL_DELAY_S
-                elif self_closed:
-                    delay = _RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S
-                else:
-                    delay = _RING_CLIP_REDIAL_DELAY_S
+                delay = (
+                    _RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S
+                    if self_closed
+                    else _RING_CLIP_REDIAL_DELAY_S
+                )
                 for attempt in range(1, _RING_CLIP_REDIAL_ATTEMPTS + 1):
                     await asyncio.sleep(delay)
                     if unload_event.is_set() or remaining <= 0:
@@ -684,28 +665,13 @@ async def _capture_ring_clip(
                             err,
                         )
                         break
-                    _, opened, _self_closed, _declined = await _record_ring_segment(
+                    _, opened, _self_closed = await _record_ring_segment(
                         coordinator,
                         writer_n,
                         max_seconds=remaining,
                         stop_events=(unload_event,),
                         prefer_dial=prefer_dial,
                     )
-                    if declined and attempt == 1:
-                        if opened:
-                            _LOGGER.info(
-                                "[abb] ring clip: declining freed station=%s, "
-                                "redial accepted",
-                                station_id,
-                            )
-                        else:
-                            _GLARE_DECLINE_TRIAL["enabled"] = False
-                            _LOGGER.warning(
-                                "[abb] ring clip: declining did not free "
-                                "station=%s; answering and hanging up again "
-                                "from the next ring",
-                                station_id,
-                            )
                     # Empty segments are dropped by finalize(), so a failed
                     # attempt costs nothing but the time it took.
                     extra_segments.append(writer_n)

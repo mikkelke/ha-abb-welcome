@@ -1592,26 +1592,6 @@ class StreamSession:
             local_send_keys=accepted.local_send_keys,
         )
 
-    async def decline_pending_call(self) -> bool:
-        """Refuse the ringing INVITE instead of answering it."""
-        listener = self._incoming_listener
-        station_id = str(self._door.station_id or "").strip()
-        if listener is None or not station_id:
-            return False
-        decline = getattr(listener, "decline_pending_call", None)
-        if not callable(decline):
-            return False
-        try:
-            return bool(await decline(station_id))
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception(
-                "[abb] media: failed to decline incoming call for door=%s "
-                "station=%s",
-                self._door.name,
-                station_id,
-            )
-            return False
-
     async def close(self) -> None:
         current_task = asyncio.current_task()
         video_nals = (

@@ -165,7 +165,6 @@ class _FakeStreamSession:
         self.active = False
         self.calls: list[object] = []
         self.call_is_station_originated = False
-        self.decline_result = False
 
     def set_packet_handlers(self, *, on_video: object, on_audio: object) -> None:
         self.calls.append(("set_packet_handlers", on_video, on_audio))
@@ -194,10 +193,6 @@ class _FakeStreamSession:
     async def close(self) -> None:
         self.calls.append("close")
         self.active = False
-
-    async def decline_pending_call(self) -> bool:
-        self.calls.append("decline")
-        return self.decline_result
 
 
 def _coordinator(
@@ -523,21 +518,5 @@ def test_async_close_media_hangs_up_an_active_call() -> None:
         assert closed is True
         assert session.calls == ["close"]
         assert state_changes == [True]
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("pending", [True, False])
-def test_async_decline_pending_ring_reports_what_the_session_declined(
-    pending: bool,
-) -> None:
-    async def scenario() -> None:
-        session = _FakeStreamSession()
-        session.decline_result = pending
-        coordinator = _coordinator(session)
-
-        assert await coordinator.async_decline_pending_ring() is pending
-
-        assert session.calls == ["decline"]
 
     asyncio.run(scenario())
