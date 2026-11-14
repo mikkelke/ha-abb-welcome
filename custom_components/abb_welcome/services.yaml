@@ -397,3 +397,18 @@ announce:
       required: false
       selector:
         text:
+
+unlock_in_call:
+  name: Unlock inside the active call
+  description: >-
+    Send the door-unlock message over the call Home Assistant already holds
+    with the given outdoor station. Does nothing when there is no such call:
+    it never places a call of its own.
+  fields:
+    station_id:
+      name: Station ID
+      description: Outdoor station id whose door to unlock.
+      example: "100000001"
+      required: true
+      selector:
+        text:

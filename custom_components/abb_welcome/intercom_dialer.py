@@ -26,11 +26,14 @@ import string
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .redaction import get_redacting_logger
+
+if TYPE_CHECKING:
+    from .sip_client import SIPClient
 
 _LOGGER = get_redacting_logger(__name__)
 
@@ -1393,3 +1396,24 @@ class IntercomDialer:
                 frame.start_line, call_id,
             )
             return True
+
+
+async def unlock_in_active_call(
+    dialer: IntercomDialer | None, sip_client: SIPClient, door: Mapping[str, object]
+) -> bool | None:
+    """Unlock ``door`` over the dialer's call with its station, or None if it has none.
+
+    A door on the INVITE route cannot place its own INVITE while that call
+    holds the gateway's only call slot. None also means ``door`` is not on the
+    INVITE route; the caller decides whether that warrants another route.
+    """
+    message = sip_client.invite_route_message(door)
+    if (
+        dialer is None
+        or message is None
+        or not dialer.in_call_with(message.station_id)
+    ):
+        return None
+    return await dialer.send_unlock_message(
+        message.station_id, message.target_uri, message.body
+    )

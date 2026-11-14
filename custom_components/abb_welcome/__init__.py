@@ -62,6 +62,7 @@ from .const import (
     topology_refresh_error,
 )
 from .coordinator import ABBWelcomeCoordinator
+from .intercom_dialer import unlock_in_active_call
 from .message_diagnostics import (
     DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS,
     MAX_MESSAGE_DIAGNOSTICS_SECONDS,
@@ -1059,6 +1060,7 @@ SERVICE_DIAGNOSE_MESSAGES = "diagnose_messages"
 SERVICE_PLAY_AUDIO = "play_audio"
 SERVICE_ANNOUNCE = "announce"
 SERVICE_RECORD_CLIP = "record_clip"
+SERVICE_UNLOCK_IN_CALL = "unlock_in_call"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -1351,6 +1353,21 @@ def _cameras_for_talk_service(hass: HomeAssistant, call: ServiceCall) -> list[ob
     if requested_entity_ids:
         return deduped
     return [deduped[0]]
+
+
+def _doors_for_station(
+    hass: HomeAssistant, station_id: str
+) -> list[tuple[dict, dict]]:
+    """Return (entry data, door) for every loaded entry that has this station."""
+    matches: list[tuple[dict, dict]] = []
+    for entry_id, entry_data in list(hass.data.get(DOMAIN, {}).items()):
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry is None:
+            continue
+        for door in entry.data.get("doors") or []:
+            if str(door.get("station_id", "")).strip() == station_id:
+                matches.append((entry_data, door))
+    return matches
 
 
 @callback
@@ -1867,6 +1884,42 @@ def _async_register_services(hass: HomeAssistant) -> None:
                         ),
                     ),
                     vol.Optional("filename"): str,
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_UNLOCK_IN_CALL):
+
+        async def _unlock_in_call(call: ServiceCall) -> None:
+            matches = _doors_for_station(hass, call.data["station_id"])
+            if not matches:
+                _LOGGER.warning("[abb] unlock_in_call: no such station, nothing sent")
+                return
+            for entry_data, door in matches:
+                sent = await unlock_in_active_call(
+                    entry_data.get("intercom_dialer"), entry_data["sip_client"], door
+                )
+                if sent is None:
+                    continue
+                if sent:
+                    _LOGGER.info("[abb] unlock_in_call: unlock MESSAGE accepted")
+                else:
+                    _LOGGER.info("[abb] unlock_in_call: unlock MESSAGE not accepted")
+                return
+            _LOGGER.info(
+                "[abb] unlock_in_call: no call to unlock over for this station, "
+                "nothing sent"
+            )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_UNLOCK_IN_CALL,
+            _unlock_in_call,
+            schema=vol.Schema(
+                {
+                    vol.Required("station_id"): vol.All(
+                        str, lambda value: value.strip(), vol.Length(min=1)
+                    ),
                 }
             ),
         )

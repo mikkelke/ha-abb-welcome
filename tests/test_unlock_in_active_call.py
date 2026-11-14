@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib.util
 import logging
@@ -10,6 +11,7 @@ import types
 from pathlib import Path
 
 import pytest
+import voluptuous
 
 _PKG_DIR = Path(__file__).resolve().parent.parent / "custom_components" / "abb_welcome"
 _PACKAGE = "abb_active_call_unlock_test"
@@ -30,7 +32,7 @@ def _load(name: str) -> types.ModuleType:
 
 
 const = _load("const")
-_load("redaction")
+redaction = _load("redaction")
 sip_client = _load("sip_client")
 intercom = _load("intercom_dialer")
 
@@ -513,3 +515,169 @@ def test_second_lock_press_keeps_the_old_unlock_path(button_module):
     assert error is None
     assert client_calls == [(BACK, "a")]
     assert requests == []
+
+
+NO_CALL = "[abb] unlock_in_call: no call to unlock over for this station, nothing sent"
+
+
+class _Services:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+        self.schemas: dict[str, object] = {}
+
+    def has_service(self, _domain: str, service: str) -> bool:
+        return service != "unlock_in_call"
+
+    def async_register(self, _domain, service, handler, schema=None) -> None:
+        self.handlers[service] = handler
+        self.schemas[service] = schema
+
+
+def _register_unlock_in_call(entries):
+    """Register the real unlock_in_call service from __init__.py.
+
+    ``entries`` maps an entry id to ``(dialer, client, doors)``. Returns the
+    registered handler and schema.
+    """
+    source = _PKG_DIR / "__init__.py"
+    wanted = {"_doors_for_station", "_async_register_services"}
+    nodes = [
+        node
+        for node in ast.parse(source.read_text()).body
+        if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id.startswith("SERVICE_")
+                for target in node.targets
+            )
+        )
+    ]
+    namespace = {
+        "DOMAIN": const.DOMAIN,
+        "vol": voluptuous,
+        "callback": lambda function: function,
+        "HomeAssistant": object,
+        "ServiceCall": object,
+        "unlock_in_active_call": intercom.unlock_in_active_call,
+        "_LOGGER": redaction.get_redacting_logger("abb_unlock_in_call_test"),
+    }
+    module = ast.Module(body=nodes, type_ignores=[])
+    exec(compile(module, str(source), "exec"), namespace)
+
+    config_entries = {
+        entry_id: types.SimpleNamespace(data={"doors": list(doors)})
+        for entry_id, (_, _, doors) in entries.items()
+    }
+    services = _Services()
+    hass = types.SimpleNamespace(
+        data={
+            const.DOMAIN: {
+                entry_id: {"intercom_dialer": dialer, "sip_client": client}
+                for entry_id, (dialer, client, _) in entries.items()
+            }
+        },
+        config_entries=types.SimpleNamespace(async_get_entry=config_entries.get),
+        services=services,
+    )
+    namespace["_async_register_services"](hass)
+    return services.handlers["unlock_in_call"], services.schemas["unlock_in_call"]
+
+
+def _call_service(handler, schema, station_id, caplog):
+    call = types.SimpleNamespace(data=schema({"station_id": station_id}))
+    with caplog.at_level(logging.INFO):
+        asyncio.run(handler(call))
+    return [(record.levelno, record.getMessage()) for record in caplog.records]
+
+
+def _unlock_in_call(
+    caplog, station_id, *, station="100000002", scripts=(OK,), with_dialer=True
+):
+    """Call the service once; return (unlock_door calls, wire requests, log)."""
+    client = _client()
+    unlock_door_calls = []
+    client.unlock_door = lambda *args: unlock_door_calls.append(args) or True
+    dialer, gateway = _dialer(station, scripts)
+    handler, schema = _register_unlock_in_call(
+        {"synthetic-entry": (dialer if with_dialer else None, client, (FRONT, BACK))}
+    )
+    log = _call_service(handler, schema, station_id, caplog)
+    return unlock_door_calls, gateway.requests, log
+
+
+def test_service_unlocks_inside_the_call_it_holds_with_the_station(caplog):
+    unlock_door_calls, requests, log = _unlock_in_call(caplog, "100000002")
+    assert unlock_door_calls == []
+    assert len(requests) == 1
+    request_line, _, body = _parse_request(requests[0])
+    assert request_line == f"MESSAGE {BACK_TARGET} SIP/2.0"
+    assert body == "1"
+    assert (logging.INFO, "[abb] unlock_in_call: unlock MESSAGE accepted") in log
+
+
+@pytest.mark.parametrize(
+    "station, with_dialer",
+    [("100000001", True), (None, True), ("", True), ("100000002", False)],
+)
+def test_service_does_nothing_without_a_call_with_the_station(
+    caplog, station, with_dialer
+):
+    unlock_door_calls, requests, log = _unlock_in_call(
+        caplog, "100000002", station=station, with_dialer=with_dialer
+    )
+    assert unlock_door_calls == []
+    assert requests == []
+    assert (logging.INFO, NO_CALL) in log
+
+
+def test_service_never_places_a_call_for_a_door_without_an_invite_route(caplog):
+    unlock_door_calls, requests, log = _unlock_in_call(
+        caplog, "100000001", station="100000001"
+    )
+    assert unlock_door_calls == []
+    assert requests == []
+    assert (logging.INFO, NO_CALL) in log
+
+
+def test_service_with_an_unknown_station_raises_nothing_and_says_so(caplog):
+    unlock_door_calls, requests, log = _unlock_in_call(caplog, "100000099")
+    assert unlock_door_calls == []
+    assert requests == []
+    assert (
+        logging.WARNING,
+        "[abb] unlock_in_call: no such station, nothing sent",
+    ) in log
+
+
+def test_service_logs_a_message_the_gateway_refuses_and_sends_it_once(caplog):
+    unlock_door_calls, requests, log = _unlock_in_call(
+        caplog, "100000002", scripts=[[("486 Busy Here", {})]]
+    )
+    assert unlock_door_calls == []
+    assert len(requests) == 1
+    assert (logging.INFO, "[abb] unlock_in_call: unlock MESSAGE not accepted") in log
+
+
+def test_service_uses_the_entry_that_holds_the_call(caplog):
+    idle_dialer, idle_gateway = _dialer(None)
+    busy_dialer, busy_gateway = _dialer("100000002")
+    handler, schema = _register_unlock_in_call(
+        {
+            "idle": (idle_dialer, _client(), (FRONT, BACK)),
+            "busy": (busy_dialer, _client(), (FRONT, BACK)),
+        }
+    )
+    _call_service(handler, schema, "100000002", caplog)
+    assert idle_gateway.requests == []
+    assert len(busy_gateway.requests) == 1
+
+
+def test_service_takes_one_non_empty_station_id():
+    _, schema = _register_unlock_in_call(
+        {"synthetic-entry": (None, _client(), (FRONT, BACK))}
+    )
+    assert schema({"station_id": " 100000002 "}) == {"station_id": "100000002"}
+    for data in ({}, {"station_id": ""}, {"station_id": "  "}, {"station_id": None}):
+        with pytest.raises(voluptuous.Invalid):
+            schema(data)
