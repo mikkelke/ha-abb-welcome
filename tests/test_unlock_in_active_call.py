@@ -301,7 +301,7 @@ def test_refuses_without_sending_unless_the_call_is_with_that_station(
     async def scenario():
         dialer, gateway = _dialer(call_station)
         gateway.closing = closing
-        assert await dialer.send_unlock_message(asked, BACK_TARGET, "1") is False
+        assert await dialer.send_unlock_message(asked, BACK_TARGET, "1") is None
         assert gateway.requests == []
 
     asyncio.run(scenario())

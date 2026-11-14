@@ -1298,26 +1298,27 @@ class IntercomDialer:
 
     async def send_unlock_message(
         self, station_id: str, target_uri: str, body: str, *, timeout: float = 5.0
-    ) -> bool:
+    ) -> bool | None:
         """Send an out-of-dialog unlock MESSAGE while our call is with the station.
 
         The gateway has one call slot, so unlocking over a second INVITE is
         refused with 486 while this call is up.  The MESSAGE is the one the
         INVITE route sends after its call is established, sent on the connection
-        that holds the call.  Returns True only on a 200 final response.
+        that holds the call.  Returns True only on a 200 final response, and
+        None when nothing was sent because the call with the station is gone.
         """
         async with self._lock:
             if not self.in_call_with(station_id):
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "[abb] dialer: cannot send unlock MESSAGE, no active call "
                     "with this station"
                 )
-                return False
+                return None
             if self._writer is None or self._writer.is_closing():
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "[abb] dialer: cannot send unlock MESSAGE, SIP writer closed"
                 )
-                return False
+                return None
 
             call_id = f"{uuid.uuid4().hex[:16]}@{self.domain}"
             from_tag = uuid.uuid4().hex[:8]
