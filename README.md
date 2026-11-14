@@ -555,6 +555,9 @@ uses that event to refresh its station list and RTSP URLs.
 - `abb_welcome.announce` - generate up to 500 characters of speech, play at most
   30 seconds through a new temporary call, then hang up; active streams or calls
   are never interrupted.
+- `abb_welcome.unlock_in_call` - unlock the door of one `station_id` over the call
+  Home Assistant already holds with that station. Does nothing when there is no
+  such call; it never places one.
 - `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
   JSON file for local debugging. This output contains secrets. Admin users
   only; the file must be inside the config directory but not in `www/`, and
