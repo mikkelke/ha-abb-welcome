@@ -1751,23 +1751,3 @@ def test_play_audio_announces_playout_length_before_the_first_packet(
     assert "media_content_id" not in hass.bus.fired[0][1]
     assert camera.play_calls == [(capture._TALKBACK_LEAD_SILENCE + pcm, "")]
     assert len(capture._TALKBACK_LEAD_SILENCE) == 6_400
-
-
-def test_play_audio_fires_no_playing_event_when_the_gate_rejects(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _fake_cached(_hass: object, _media_content_id: str) -> bytes:
-        return bytes(160)
-
-    monkeypatch.setattr(capture, "async_prepare_talkback_audio_cached", _fake_cached)
-
-    camera = _TalkbackCamera(talkback_ready=True, talkback_audible=False)
-    hass = _ServiceHass(camera)
-    capture._async_register_services(hass)
-    play_audio = hass.services.handlers[capture.SERVICE_PLAY_AUDIO]
-    call = _FakeServiceCall({"media": {"media_content_id": "media-source://tts/x"}})
-
-    with pytest.raises(_CaptureHomeAssistantError, match="does not render audio"):
-        asyncio.run(play_audio(call))
-
-    assert hass.bus.fired == []

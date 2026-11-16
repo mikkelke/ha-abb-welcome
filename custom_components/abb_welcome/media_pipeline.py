@@ -1070,7 +1070,7 @@ class StreamSession:
 
     @property
     def talkback_audible(self) -> bool:
-        return self.talkback_ready and not self.call_is_station_originated
+        return self.talkback_ready
 
     def talkback_stats(self) -> dict[str, Any]:
         sender = self._talk_sender

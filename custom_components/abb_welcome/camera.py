@@ -789,13 +789,6 @@ class StationStreamCoordinator:
                 session_id,
             )
         self._talkback_owner = session_id
-        if self.session.call_is_station_originated:
-            _LOGGER.warning(
-                "[abb] talkback: station=%s call was station-originated; the "
-                "outdoor station will not render this audio until a Home "
-                "Assistant-dialled call replaces it",
-                self.door.station_id or self.door.address,
-            )
         stats = self.session.start_talkback()
         stats["owner"] = self._talkback_owner
         self._notify_state()
@@ -862,13 +855,6 @@ class StationStreamCoordinator:
             return stats
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
-        if self.session.call_is_station_originated:
-            _LOGGER.warning(
-                "[abb] talkback: station=%s call was station-originated; the "
-                "outdoor station will not render this audio until a Home "
-                "Assistant-dialled call replaces it",
-                self.door.station_id or self.door.address,
-            )
         stats = await self.session.send_talkback_tone(
             duration_ms=duration_ms,
             frequency_hz=frequency_hz,
@@ -896,13 +882,6 @@ class StationStreamCoordinator:
             return stats
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
-        if self.session.call_is_station_originated:
-            _LOGGER.warning(
-                "[abb] talkback: station=%s call was station-originated; the "
-                "outdoor station will not render this audio until a Home "
-                "Assistant-dialled call replaces it",
-                self.door.station_id or self.door.address,
-            )
         stats = await self.session.send_talkback_pcm16le_audio(
             pcm, on_started=on_started
         )

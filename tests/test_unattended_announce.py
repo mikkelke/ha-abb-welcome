@@ -400,13 +400,12 @@ def test_rtsp_attach_is_rejected_and_closed_during_peer_announcement() -> None:
     asyncio.run(scenario())
 
 
-def test_send_talkback_pcm16le_audio_warns_but_proceeds_on_a_station_originated_call(
+def test_send_talkback_pcm16le_audio_plays_on_a_station_originated_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A picked-up doorbell call IS a station-originated call, and
     talk_pcm16le is the microphone path the Scrypted plugin uses for
-    two-way audio on exactly that call - it must keep working, just with a
-    logged warning that the outdoor station itself renders no audio for it."""
+    two-way audio on exactly that call."""
     warnings: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         camera,
@@ -423,24 +422,22 @@ def test_send_talkback_pcm16le_audio_warns_but_proceeds_on_a_station_originated_
 
         assert result == {"packets": 3, "owner": ""}
         assert session.calls == [("play", b"speech")]
-        assert len(warnings) == 1
+        assert warnings == []
 
         session.call_is_station_originated = False
         result = await coordinator.send_talkback_pcm16le_audio(b"speech")
 
         assert result == {"packets": 3, "owner": ""}
         assert session.calls == [("play", b"speech"), ("play", b"speech")]
-        assert len(warnings) == 1
+        assert warnings == []
 
     asyncio.run(scenario())
 
 
-def test_send_talkback_tone_warns_but_proceeds_on_a_station_originated_call(
+def test_send_talkback_tone_plays_on_a_station_originated_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same contract as send_talkback_pcm16le_audio: talk_tone is also a
-    station-originated-call-safe microphone/diagnostics service, not a door
-    announcement, so it must not refuse a picked-up call either."""
+    """Same contract as send_talkback_pcm16le_audio for talk_tone."""
     warnings: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         camera,
@@ -459,7 +456,7 @@ def test_send_talkback_tone_warns_but_proceeds_on_a_station_originated_call(
 
         assert result == {"packets": 1, "owner": ""}
         assert session.calls == [("tone", 1200, 880, 0.35)]
-        assert len(warnings) == 1
+        assert warnings == []
 
     asyncio.run(scenario())
 

@@ -1758,11 +1758,6 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 raise HomeAssistantError(
                     "Talkback is not ready; open the selected camera stream first"
                 )
-            if not bool(getattr(camera, "talkback_audible", True)):
-                raise HomeAssistantError(
-                    "The outdoor station does not render audio on a call it "
-                    "originated; wait for a Home Assistant-dialled call"
-                )
             def _fire_playing() -> None:
                 hass.bus.async_fire(
                     EVENT_TALKBACK_PLAYING,
