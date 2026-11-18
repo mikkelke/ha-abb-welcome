@@ -532,7 +532,7 @@ class StationStreamCoordinator:
         self.session.set_packet_handlers(on_video=None, on_audio=None)
         self._handlers_installed = False
 
-    async def async_open_for_ring(self, *, prefer_dial: bool = False) -> bool:
+    async def async_open_for_ring(self) -> bool:
         """Open (or reuse) the media session for native ring-clip capture.
 
         Installs the packet handlers so registered sinks receive RTP even
@@ -546,7 +546,7 @@ class StationStreamCoordinator:
         async with self._stream_lock:
             if not self.session.active:
                 try:
-                    await self.session.open(prefer_dial=prefer_dial)
+                    await self.session.open()
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.warning(
                         "[abb] stream coordinator: failed to open media for "
@@ -925,17 +925,6 @@ class StationStreamCoordinator:
             self._temporary_talkback_active = False
             self._temporary_talkback_task = None
             self._notify_state()
-
-    async def async_close_media(self) -> bool:
-        """Hang up the current call without disturbing sinks or handlers."""
-        if self._rtsp_play_sessions or self._temporary_talkback_active:
-            return False
-        async with self._stream_lock:
-            if not self.session.active:
-                return False
-            await self.session.close()
-        self._notify_state()
-        return True
 
 
 class ABBWelcomeCamera(Camera):

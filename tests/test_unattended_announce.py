@@ -244,10 +244,6 @@ def test_temporary_announcement_opens_plays_closes_and_clears_state() -> None:
         assert result == {"packets": 3}
         assert session.calls == [
             ("set_packet_handlers", None, None),
-            # The station never renders talkback on a call it originated, so
-            # an unattended announcement must always dial rather than answer
-            # a pending INVITE - see the send_temporary_talkback regression
-            # this guards against.
             ("open", True),
             ("play", b"speech"),
             "close",
@@ -482,38 +478,5 @@ def test_send_talkback_pcm16le_audio_owner_mismatch_never_starts_playback() -> N
         assert result["ignore_reason"] == "talkback_session_owner_mismatch"
         assert session.calls == []
         assert started == []
-
-    asyncio.run(scenario())
-
-
-def test_async_close_media_leaves_an_attached_rtsp_session_alone() -> None:
-    async def scenario() -> None:
-        session = _FakeStreamSession()
-        session.active = True
-        coordinator = _coordinator(session)
-        coordinator._rtsp_play_sessions.append(object())
-
-        closed = await coordinator.async_close_media()
-
-        assert closed is False
-        assert session.calls == []
-        assert session.active is True
-
-    asyncio.run(scenario())
-
-
-def test_async_close_media_hangs_up_an_active_call() -> None:
-    async def scenario() -> None:
-        session = _FakeStreamSession()
-        session.active = True
-        coordinator = _coordinator(session)
-        state_changes: list[bool] = []
-        coordinator.add_state_callback(lambda: state_changes.append(True))
-
-        closed = await coordinator.async_close_media()
-
-        assert closed is True
-        assert session.calls == ["close"]
-        assert state_changes == [True]
 
     asyncio.run(scenario())

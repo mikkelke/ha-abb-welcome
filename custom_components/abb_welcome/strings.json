@@ -102,7 +102,6 @@
           "ring_clip_seconds": "Ring clip duration (seconds)",
           "ring_clip_dir": "Ring clip storage directory (absolute, or relative to the Home Assistant config folder; keep it out of www, which is public)",
           "ring_clip_continue_after_hangup": "Continue recording after the ring call ends (re-dials the station)",
-          "ring_clip_dial_instead_of_answer": "Call the station on a ring instead of answering it (required for an audible announcement)",
           "ring_clip_stations": "Stations that record ring clips (none selected = every station)"
         }
       }

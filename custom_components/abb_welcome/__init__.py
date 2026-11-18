@@ -33,7 +33,6 @@ from .const import (
     CONF_LAN_RTSP_PROXY,
     CONF_RECORD_RING_CLIPS,
     CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
-    CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
     CONF_RING_CLIP_DIR,
     CONF_TALKBACK_OUTPUT_GAIN_DB,
     CONF_UNLOCK_STRATEGY,
@@ -44,7 +43,6 @@ from .const import (
     DEFAULT_LAN_RTSP_PROXY,
     DEFAULT_RECORD_RING_CLIPS,
     DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
-    DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
     DEFAULT_RING_CLIP_DIR,
     DOMAIN,
     EVENT_DISCOVERY_CHANGED,
@@ -250,11 +248,6 @@ _TALKBACK_LEAD_SILENCE = bytes(_TALKBACK_LEAD_SILENCE_MS * _TALKBACK_PCM_BYTES_P
 # Mandatory settle time before re-dialing for a continuation segment.
 # Measured live: immediate re-dials return zero video and get BYE'd.
 _RING_CLIP_REDIAL_DELAY_S = 2.5
-# After a hangup WE sent (self_closed), the station has had nothing to tear
-# down on its side, so a shorter settle is tried first; the existing
-# _RING_CLIP_REDIAL_ATTEMPTS loop with _RING_CLIP_REDIAL_RETRY_DELAY_S
-# remains the safety net if it is refused.
-_RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S = 1.0
 # The station can still be tearing down its own call when the first redial
 # lands, which is how the back door lost every clip: its ring call is only
 # ~1.45 s (vs ~5.5 s at the front), so the redial arrives while the station is
@@ -262,16 +255,6 @@ _RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S = 1.0
 # station on demand a minute later works fine, so this is timing, not capability.
 _RING_CLIP_REDIAL_RETRY_DELAY_S = 2.0
 _RING_CLIP_REDIAL_ATTEMPTS = 3
-
-# Flat wait after answering the station's own (silent, glare-answered) ring
-# call, before we hang it up ourselves so the redial can bring up a call we
-# actually dialled. The accept path already waits for the station's ACK —
-# the accept log shows ack=True by the time we start using the call — so
-# this hold no longer has to buy that time; it only needs to outlast
-# whatever media setup is still in flight. 0.2s is the smallest value we
-# are willing to try here, not a measured number: a 486 on the redial still
-# falls back to the existing _RING_CLIP_REDIAL_ATTEMPTS retry loop below.
-_RING_CLIP_GLARE_HOLD_S = 0.2
 
 
 def _fire_discovery_changed(
@@ -405,22 +388,15 @@ async def _record_ring_segment(
     *,
     max_seconds: float,
     stop_events: tuple[asyncio.Event, ...],
-    prefer_dial: bool = False,
-    glare_hold_s: float | None = None,
-) -> tuple[bool, bool, bool]:
+) -> tuple[bool, bool]:
     """Record one segment onto ``writer``.
 
-    Returns ``(call_ended, media_opened, self_closed)``. ``async_open_for_ring``
-    never raises - it logs and reports failure through its return value - and
+    Returns ``(call_ended, media_opened)``. ``async_open_for_ring`` never
+    raises - it logs and reports failure through its return value - and
     ignoring that meant a failed open still sat out the whole ``max_seconds``
     waiting for packets that could not arrive. Measured on a back-door ring:
     the open failed at 10:19:58.567 and the clip finished at 10:20:08.569,
     ten seconds of nothing.
-
-    ``glare_hold_s``, when set, bounds how long a glare-answered call (see
-    below) is held open for video before we hang it up ourselves so the
-    caller's redial can bring up a call that can actually carry an
-    announcement.
     """
     call_ended = asyncio.Event()
 
@@ -429,42 +405,14 @@ async def _record_ring_segment(
 
     coordinator.add_packet_sink(writer)
     coordinator.add_call_ended_callback(_on_call_ended)
-    self_closed = False
     try:
-        opened = await coordinator.async_open_for_ring(prefer_dial=prefer_dial)
-        glare_answered = False
-        if not opened and prefer_dial:
-            # Glare: the station has an INVITE outstanding to us, so it may
-            # refuse ours. Answering it still gets the video even though that
-            # call will not carry an audible announcement - a silent clip beats
-            # no clip.
-            _LOGGER.info(
-                "[abb] ring clip: outbound dial refused, answering the "
-                "station's own call instead (announcement will be silent)"
-            )
-            opened = await coordinator.async_open_for_ring(prefer_dial=False)
-            glare_answered = opened
+        opened = await coordinator.async_open_for_ring()
         if opened:
-            if glare_answered and glare_hold_s is not None:
-                elapsed = min(max_seconds, glare_hold_s)
-                await _wait_for_first(elapsed, call_ended, *stop_events)
-                if not call_ended.is_set() and not any(
-                    event.is_set() for event in stop_events
-                ):
-                    self_closed = await coordinator.async_close_media()
-                    if self_closed:
-                        _LOGGER.info(
-                            "[abb] ring clip: hung up the station's own "
-                            "silent call after %.1fs so a dialled call can "
-                            "carry the announcement",
-                            elapsed,
-                        )
-            else:
-                await _wait_for_first(max_seconds, call_ended, *stop_events)
+            await _wait_for_first(max_seconds, call_ended, *stop_events)
     finally:
         coordinator.remove_call_ended_callback(_on_call_ended)
         coordinator.remove_packet_sink(writer)
-    return call_ended.is_set(), opened, self_closed
+    return call_ended.is_set(), opened
 
 
 def _ring_clip_url(hass: HomeAssistant, target_dir: Path, filename: str) -> str:
@@ -605,22 +553,11 @@ async def _capture_ring_clip(
 
         extra_segments: list[RingClipWriter] = []
         try:
-            # An announcement is only worth anything BEFORE the door opens, and
-            # the station will not play one on a call it originated - so for a
-            # ring, place our own call instead of answering its.
-            prefer_dial = reason == "ring" and bool(
-                entry.options.get(
-                    CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
-                    DEFAULT_RING_CLIP_DIAL_INSTEAD_OF_ANSWER,
-                )
-            )
-            call_ended, _opened, self_closed = await _record_ring_segment(
+            call_ended, _opened = await _record_ring_segment(
                 coordinator,
                 writer,
                 max_seconds=seconds,
                 stop_events=(unload_event,),
-                prefer_dial=prefer_dial,
-                glare_hold_s=_RING_CLIP_GLARE_HOLD_S,
             )
 
             continue_after_hangup = bool(
@@ -631,17 +568,13 @@ async def _capture_ring_clip(
             )
             if (
                 reason == "ring"
-                and (continue_after_hangup or self_closed)
-                and (call_ended or self_closed)
+                and continue_after_hangup
+                and call_ended
                 and not unload_event.is_set()
                 and writer.elapsed_s < seconds
             ):
                 remaining = seconds - writer.elapsed_s
-                delay = (
-                    _RING_CLIP_SELF_CLOSE_REDIAL_DELAY_S
-                    if self_closed
-                    else _RING_CLIP_REDIAL_DELAY_S
-                )
+                delay = _RING_CLIP_REDIAL_DELAY_S
                 for attempt in range(1, _RING_CLIP_REDIAL_ATTEMPTS + 1):
                     await asyncio.sleep(delay)
                     if unload_event.is_set() or remaining <= 0:
@@ -663,12 +596,11 @@ async def _capture_ring_clip(
                             err,
                         )
                         break
-                    _, opened, _self_closed = await _record_ring_segment(
+                    _, opened = await _record_ring_segment(
                         coordinator,
                         writer_n,
                         max_seconds=remaining,
                         stop_events=(unload_event,),
-                        prefer_dial=prefer_dial,
                     )
                     # Empty segments are dropped by finalize(), so a failed
                     # attempt costs nothing but the time it took.

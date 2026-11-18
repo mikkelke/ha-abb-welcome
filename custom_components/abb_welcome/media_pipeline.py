@@ -1178,11 +1178,7 @@ class StreamSession:
         """Dial gateway and start receiving RTP.
 
         ``prefer_dial`` skips answering a pending incoming call and places our
-        own outbound one instead. That matters for audio, not for video: the
-        station does not render talkback on a call it originated (measured:
-        clean RTP, zero send errors, repeated human nulls at the door) but does
-        on one Home Assistant dialled. An announcement is only worth anything
-        before the door opens, so it has to ride a call of the second kind.
+        own outbound call.
         """
         loop = asyncio.get_running_loop()
         self._accepted_incoming_call_id = None

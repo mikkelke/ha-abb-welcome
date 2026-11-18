@@ -1244,20 +1244,3 @@ def test_ring_clip_stations_option_drops_unknown_station_ids() -> None:
     result = asyncio.run(flow.async_step_init(submitted))
     assert result["type"] == "create_entry"
     assert result["data"][module.CONF_RING_CLIP_STATIONS] == ["station-front"]
-
-
-def test_ring_clip_dial_instead_of_answer_defaults_false_and_persists() -> None:
-    module = _load_config_flow()
-    flow = module.ABBWelcomeOptionsFlow(
-        _options_entry(
-            module, [{"name": "Synthetic Front", "station_id": "station-front"}]
-        )
-    )
-    form = asyncio.run(flow.async_step_init())
-    assert _schema_default(form, module.CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER) is False
-
-    submitted = _options_input(module, module.UNLOCK_STRATEGY_STANDARD)
-    submitted[module.CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER] = True
-    saved = asyncio.run(flow.async_step_init(submitted))
-    assert saved["type"] == "create_entry"
-    assert saved["data"][module.CONF_RING_CLIP_DIAL_INSTEAD_OF_ANSWER] is True
